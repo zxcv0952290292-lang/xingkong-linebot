@@ -1,0 +1,8 @@
+*.log
+*.tmp
+.venv
+__pycache__
+.env
+last_stock_push.json*
+track_picks.json
+web_picks.json
