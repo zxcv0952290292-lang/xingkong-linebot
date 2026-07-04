@@ -401,10 +401,11 @@ def api_analyze():
 @app.route("/api/vote", methods=["GET", "POST"])
 def api_vote():
     """每日推播的看多/看空投票，累計存 Supabase。"""
-    vote = (request.args.get("vote") or "").strip()
+    raw = (request.args.get("vote") or "").strip().lower()
+    vote = {"bull": "up", "bear": "down", "up": "up", "down": "down"}.get(raw)
     date = (request.args.get("date") or datetime.now().strftime("%Y-%m-%d")).replace("/", "-")
-    if vote not in ("up", "down"):
-        return jsonify({"error": "vote 只能是 up 或 down"}), 400
+    if not vote:
+        return jsonify({"error": "vote 只能是 up/down/bull/bear"}), 400
     if not supa.enabled():
         return jsonify({"ok": False, "reason": "db 未設定"})
     key = f"stock_vote_{date}"
