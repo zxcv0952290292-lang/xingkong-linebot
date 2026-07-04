@@ -435,6 +435,8 @@ def api_backtest():
         "buckets": buckets,
         "recent": [{"date": r["push_date"], "name": r.get("name") or r["code"],
                     "code": r["code"], "ret": r["return_pct"]} for r in rows[:12]],
+        "all": [{"date": r["push_date"], "name": r.get("name") or r["code"],
+                 "code": r["code"], "ret": r["return_pct"]} for r in rows],
     })
 
 @app.route("/")
