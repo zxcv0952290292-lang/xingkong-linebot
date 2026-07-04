@@ -10,6 +10,7 @@ import os
 import anthropic
 from collections import defaultdict, deque
 from datetime import datetime
+import supa  # Supabase 對話記憶（重啟不忘）
 
 # ─── shared status logger（雲端寫 /tmp，Log 中會列印）───────
 _STATUS_FILE = os.environ.get("STATUS_FILE", "/tmp/status.json")
@@ -58,8 +59,31 @@ LAST_PUSH_FILE = os.path.join(BASE, "last_stock_push.json")
 
 claude_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
-# 每位用戶最近 10 則對話記憶（重啟即清空）
+# 每位用戶最近 10 則對話記憶
+# ─ Supabase 開啟時存 line_chat_history（重啟不忘）；否則退回記憶體 deque ─
 chat_history = defaultdict(lambda: deque(maxlen=10))
+
+def load_history(user_id):
+    """取回該用戶最近 10 則對話，回傳 [{role, content}, ...]（時間由舊到新）。"""
+    if supa.enabled():
+        rows = supa.select(
+            "line_chat_history",
+            f"user_id=eq.{user_id}&select=role,content&order=id.desc&limit=10",
+        )
+        rows = list(reversed(rows))  # 由舊到新
+        return [{"role": r["role"], "content": r["content"]} for r in rows]
+    return list(chat_history[user_id])
+
+def save_turn(user_id, user_message, reply):
+    """存一輪對話（user + assistant 兩則）。"""
+    if supa.enabled():
+        supa.insert("line_chat_history", [
+            {"user_id": user_id, "role": "user", "content": user_message},
+            {"user_id": user_id, "role": "assistant", "content": reply},
+        ])
+    else:
+        chat_history[user_id].append({"role": "user", "content": user_message})
+        chat_history[user_id].append({"role": "assistant", "content": reply})
 
 SYSTEM_PROMPT = """你是小星空 ⭐，一個可愛又幽默的 AI 助理，是使用者最貼心的朋友。
 
@@ -99,7 +123,7 @@ def build_system_prompt():
 
 def ask_ai(user_id, user_message):
     try:
-        history = list(chat_history[user_id])
+        history = load_history(user_id)
         messages = history + [{"role": "user", "content": user_message}]
         response = claude_client.messages.create(
             model="claude-haiku-4-5-20251001",
@@ -108,8 +132,7 @@ def ask_ai(user_id, user_message):
             messages=messages
         )
         reply = response.content[0].text
-        chat_history[user_id].append({"role": "user", "content": user_message})
-        chat_history[user_id].append({"role": "assistant", "content": reply})
+        save_turn(user_id, user_message, reply)
         return reply
     except Exception as e:
         notify_owner(f"⚠️ 小星空出錯：{e}")
