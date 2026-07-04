@@ -1,0 +1,18 @@
+name: 股票到價提醒掃描
+
+# 台股盤中每 5 分鐘打一次掃描端點（UTC+8 09:00–13:55 → UTC 01:00–05:55）
+# 端點本身還會再擋一次盤中時間，週末/盤後會回 skipped，不會誤推。
+on:
+  schedule:
+    - cron: '*/5 1-5 * * 1-5'
+  workflow_dispatch:   # 允許手動觸發測試
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 呼叫到價掃描端點
+        run: |
+          curl -sS -m 90 -X POST \
+            "https://xingkong-linebot.onrender.com/tasks/scan_alerts?token=${{ secrets.SCAN_TOKEN }}" \
+            -w '\nHTTP %{http_code}\n'

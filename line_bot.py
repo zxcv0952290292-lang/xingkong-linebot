@@ -57,6 +57,7 @@ LINE_CHANNEL_SECRET = os.environ["LINE_CHANNEL_SECRET"]
 LINE_CHANNEL_TOKEN = os.environ["LINE_CHANNEL_TOKEN"]
 OWNER_UID = os.environ.get("OWNER_UID", "U6d485aa77b4a6779f61ad7c263e43d65")
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
+SCAN_TOKEN = os.environ.get("SCAN_TOKEN", "")  # 保護 /tasks/scan_alerts
 BASE = os.path.dirname(os.path.abspath(__file__))
 LAST_PUSH_FILE = os.path.join(BASE, "last_stock_push.json")
 
@@ -156,6 +157,144 @@ def reply_message(reply_token, text):
         json={"replyToken": reply_token, "messages": [{"type": "text", "text": text}]}
     )
     print(f"[LINE回覆狀態]: {res.status_code} {res.text}")
+
+def push_message(uid, text):
+    """主動推播給任一使用者（到價提醒用）。"""
+    try:
+        requests.post(
+            "https://api.line.me/v2/bot/message/push",
+            headers={"Content-Type": "application/json", "Authorization": f"Bearer {LINE_CHANNEL_TOKEN}"},
+            json={"to": uid, "messages": [{"type": "text", "text": text}]}, timeout=10)
+    except Exception as e:
+        print(f"[push err] {e}")
+
+# ══════════════════════════════════════════════════════════════
+#  股票到價提醒（#10）— LINE 打字設定，盤中每 5 分外部 cron 掃描
+#  存於 module_status（免 DDL）：module = palert:{uid}:{code}
+# ══════════════════════════════════════════════════════════════
+ALERT_PREFIX = "palert"
+
+def _now_iso():
+    return datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+
+def _alert_key(uid, code):
+    return f"{ALERT_PREFIX}:{uid}:{code}"
+
+def _parse_alert(text):
+    """解析到價指令 → {'code','target','direction'} 或 None。
+    例：'2330 到 600'、'2330 漲到 600'、'2330 跌破 550'、'2330>600'、'提醒我 2330 到 600'
+    direction: 'above' / 'below' / None(依現價推斷)"""
+    t = text.strip().replace("　", " ")
+    m = re.search(
+        r"(\d{3,6})\D*?(漲到|跌到|跌破|突破|站上|高於|低於|大於|小於|以上|以下|到|破|≥|≤|>|<|=)\s*(\d+(?:\.\d+)?)",
+        t)
+    if not m:
+        return None
+    code, kw, price = m.group(1), m.group(2), float(m.group(3))
+    above_kw = ("漲到", "突破", "站上", "高於", "大於", "以上", "破", "≥", ">")
+    below_kw = ("跌到", "跌破", "低於", "小於", "以下", "≤", "<")
+    direction = "above" if kw in above_kw else ("below" if kw in below_kw else None)
+    return {"code": code, "target": price, "direction": direction}
+
+def set_alert(uid, code, target, direction):
+    """設定到價提醒。回 dict 或 None（代號查無）。"""
+    info, _ = _yahoo_quote(code)
+    if not info:
+        return None
+    cur = info["price"]
+    name = STOCK_NAMES.get(code, code)
+    if direction is None:
+        direction = "above" if target >= cur else "below"
+    supa.upsert("module_status", [{
+        "module_name": _alert_key(uid, code),
+        "last_run": _now_iso(),
+        "status": "active",
+        "detail": {"user_id": uid, "code": code, "name": name, "target": target,
+                   "direction": direction, "active": True,
+                   "created": _now_iso(), "set_price": cur},
+    }], "module_name")
+    return {"name": name, "cur": cur, "target": target, "direction": direction}
+
+def list_alerts(uid):
+    rows = supa.select("module_status", f"module_name=like.{ALERT_PREFIX}:{uid}:*&select=detail")
+    return [r["detail"] for r in rows if (r.get("detail") or {}).get("active")]
+
+def cancel_alert(uid, code):
+    rows = supa.select("module_status", f"module_name=eq.{_alert_key(uid, code)}&select=detail")
+    if not rows or not (rows[0].get("detail") or {}).get("active"):
+        return False
+    ex = rows[0]["detail"]
+    ex["active"] = False
+    supa.upsert("module_status", [{"module_name": _alert_key(uid, code), "last_run": _now_iso(),
+                                    "status": "cancelled", "detail": ex}], "module_name")
+    return True
+
+def handle_alert_command(uid, text):
+    """是到價相關指令就處理並回字串；否則回 None（交給 AI）。"""
+    t = text.strip()
+    if t in ("到價清單", "我的到價", "到價", "查到價", "提醒清單", "到價提醒"):
+        alerts = list_alerts(uid)
+        if not alerts:
+            return "你目前沒有設定到價提醒。\n\n設定方式：輸入「2330 到 600」\n就會在台積電到 600 時通知你 🔔"
+        lines = ["🔔 你的到價提醒："]
+        for ex in alerts:
+            arrow = "漲到" if ex["direction"] == "above" else "跌到"
+            lines.append(f"・{ex['name']}（{ex['code']}）{arrow} {ex['target']}")
+        lines.append("\n刪除：輸入「刪 2330」")
+        return "\n".join(lines)
+    m = re.match(r"^(刪|刪除|取消|移除)\s*(\d{3,6})", t)
+    if m:
+        ok = cancel_alert(uid, m.group(2))
+        return f"已刪除 {m.group(2)} 的到價提醒 ✅" if ok else f"找不到 {m.group(2)} 的到價提醒 🤔"
+    parsed = _parse_alert(t)
+    if parsed:
+        r = set_alert(uid, parsed["code"], parsed["target"], parsed["direction"])
+        if not r:
+            return f"找不到股票 {parsed['code']}，請確認代號正確 🤔"
+        arrow = "漲到" if r["direction"] == "above" else "跌到"
+        return (f"✅ 到價提醒設定完成\n"
+                f"{r['name']}（{parsed['code']}）目前 {r['cur']}\n"
+                f"當它{arrow} {r['target']} 就通知你 🔔\n\n"
+                f"（台股盤中每 5 分鐘檢查；輸入「到價清單」可查看）")
+    return None
+
+def _market_open():
+    """台股盤中：週一至週五 09:00–13:35（台灣時間，Render 跑 UTC）。"""
+    now = datetime.utcnow() + timedelta(hours=8)
+    if now.weekday() >= 5:
+        return False
+    hm = now.hour * 60 + now.minute
+    return 9 * 60 <= hm <= 13 * 60 + 35
+
+def scan_alerts():
+    """掃一次所有 active 到價提醒，到價就 push 並標記 fired（idempotent）。"""
+    rows = supa.select("module_status", f"module_name=like.{ALERT_PREFIX}:*&select=module_name,detail")
+    active = [(r["module_name"], r["detail"]) for r in rows if (r.get("detail") or {}).get("active")]
+    if not active:
+        return {"checked": 0, "fired": 0}
+    by_code = {}
+    for module, ex in active:
+        by_code.setdefault(ex["code"], []).append((module, ex))
+    fired = 0
+    for code, items in by_code.items():
+        info, _ = _yahoo_quote(code)
+        if not info:
+            continue
+        price = info["price"]
+        for module, ex in items:
+            hit = price >= ex["target"] if ex["direction"] == "above" else price <= ex["target"]
+            if not hit:
+                continue
+            ex2 = dict(ex); ex2["active"] = False
+            ex2["fired_price"] = price; ex2["fired_at"] = _now_iso()
+            supa.upsert("module_status", [{"module_name": module, "last_run": _now_iso(),
+                                            "status": "fired", "detail": ex2}], "module_name")
+            arrow = "漲到" if ex["direction"] == "above" else "跌到"
+            push_message(ex["user_id"],
+                         f"🔔 到價提醒觸發\n{ex['name']}（{code}）現在 {price}\n"
+                         f"已{arrow}你設定的 {ex['target']} ⭐\n\n輸入代號可查即時分析")
+            fired += 1
+    return {"checked": len(active), "fired": fired}
 
 # ══════════════════════════════════════════════════════════════
 #  自選股即時分析 API
@@ -393,14 +532,14 @@ def api_vote():
     if not supa.enabled():
         return jsonify({"ok": False, "reason": "db 未設定"})
     key = f"stock_vote_{date}"
-    rows = supa.select("module_status", f"module=eq.{key}&select=extras")
-    cur = (rows[0].get("extras") if rows else None) or {}
+    rows = supa.select("module_status", f"module_name=eq.{key}&select=detail")
+    cur = (rows[0].get("detail") if rows else None) or {}
     cur[vote] = int(cur.get(vote, 0)) + 1
     supa.upsert("module_status", [{
-        "module": key,
+        "module_name": key,
         "last_run": datetime.now().strftime("%Y-%m-%dT%H:%M:%S") + "+08:00",
-        "status": "vote", "extras": cur,
-    }], "module")
+        "status": "vote", "detail": cur,
+    }], "module_name")
     return jsonify({"ok": True, "up": cur.get("up", 0), "down": cur.get("down", 0)})
 
 @app.route("/api/backtest")
@@ -439,6 +578,20 @@ def api_backtest():
                  "code": r["code"], "ret": r["return_pct"]} for r in rows],
     })
 
+@app.route("/tasks/scan_alerts", methods=["GET", "POST"])
+def task_scan_alerts():
+    """外部 cron（GitHub Actions 每 5 分）呼叫 → 掃一次到價提醒。"""
+    token = request.args.get("token") or request.headers.get("X-Scan-Token", "")
+    if SCAN_TOKEN and token != SCAN_TOKEN:
+        abort(403)
+    if not supa.enabled():
+        return jsonify({"error": "db off"}), 503
+    if not _market_open() and not request.args.get("force"):
+        return jsonify({"skipped": "market_closed"})
+    result = scan_alerts()
+    print(f"[scan_alerts] {result}")
+    return jsonify(result)
+
 @app.route("/")
 def index():
     return "小星空 online ⭐", 200
@@ -470,9 +623,18 @@ def webhook():
             user_message = event["message"]["text"]
             reply_token = event["replyToken"]
             print(f"[用戶訊息]: {user_message}")
-            ai_response = ask_ai(user_id, user_message)
-            print(f"[AI回覆]: {ai_response[:80]}")
-            reply_message(reply_token, ai_response)
+            # 先看是不是到價提醒指令，是就直接回、不走 AI
+            try:
+                alert_reply = handle_alert_command(user_id, user_message) if supa.enabled() else None
+            except Exception as e:
+                print(f"[alert err] {e}")
+                alert_reply = None
+            if alert_reply is not None:
+                reply_message(reply_token, alert_reply)
+            else:
+                ai_response = ask_ai(user_id, user_message)
+                print(f"[AI回覆]: {ai_response[:80]}")
+                reply_message(reply_token, ai_response)
             _write_status("line_bot", "已回覆訊息", {"messages_today": _bump_messages_today()})
 
     return "OK"
