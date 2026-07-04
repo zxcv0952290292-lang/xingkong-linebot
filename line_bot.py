@@ -185,55 +185,36 @@ def _finmind(dataset, code, days=12):
         pass
     return []
 
-def _get_price(code):
-    # 先試 TWSE 即時報價（盤中即時）——但非台灣 IP（如 Render 新加坡機房）抓不到，超時設短一點
-    for ex in ("tse", "otc"):
-        try:
-            r = requests.get(
-                "https://mis.twse.com.tw/stock/api/getStockInfo.jsp",
-                params={"ex_ch": f"{ex}_{code}.tw", "json": "1", "delay": "0"},
-                timeout=4)
-            d = (r.json().get("msgArray") or [None])[0]
-            if d and d.get("z") and d["z"] != "-":
-                prev = d.get("y")
-                return {
-                    "name": d.get("n", code),
-                    "price": float(d["z"]),
-                    "prev": float(prev) if prev not in (None, "-", "") else 0,
-                    "exchange": "上市" if ex == "tse" else "上櫃",
-                }
-        except Exception:
-            pass
-    # 備援：Yahoo Finance（全球可存取，Render 也抓得到；名稱為英文）
+def _yahoo_quote(code):
+    """一次 Yahoo chart 請求同時取得報價與技術指標（省一次網路來回；Yahoo 全球可存取）。
+    回傳 (info, kline)。找不到回 (None, None)。"""
     for suf, exch in ((".TW", "上市"), (".TWO", "上櫃")):
         try:
             r = requests.get(
                 f"https://query1.finance.yahoo.com/v8/finance/chart/{code}{suf}",
-                params={"interval": "1d", "range": "5d"},
+                params={"interval": "1d", "range": "6mo"},
                 headers={"User-Agent": STOCK_UA}, timeout=10)
-            m = (((r.json().get("chart") or {}).get("result") or [{}])[0]).get("meta") or {}
-            price = m.get("regularMarketPrice")
-            if price:
-                return {
-                    "name": m.get("shortName") or m.get("longName") or code,
-                    "price": float(price),
-                    "prev": float(m.get("chartPreviousClose") or m.get("previousClose") or 0),
-                    "exchange": exch,
-                }
+            result = ((r.json().get("chart") or {}).get("result") or [None])[0]
+            if not result:
+                continue
+            meta = result.get("meta") or {}
+            price = meta.get("regularMarketPrice")
+            if not price:
+                continue
+            info = {
+                "name": code,  # 中文名稍後由對照表覆蓋
+                "price": float(price),
+                "prev": float(meta.get("chartPreviousClose") or meta.get("previousClose") or 0),
+                "exchange": exch,
+            }
+            return info, _kline_from_result(result)
         except Exception:
             pass
-    return None
+    return None, None
 
-def _get_kline(code, exchange):
-    suffix = ".TW" if exchange == "上市" else ".TWO"
+def _kline_from_result(result):
+    """從 Yahoo chart result 算技術指標（MA/RSI/MACD/布林/支撐壓力/量比）。"""
     try:
-        r = requests.get(
-            f"https://query1.finance.yahoo.com/v8/finance/chart/{code}{suffix}",
-            params={"interval": "1d", "range": "3mo"},
-            headers={"User-Agent": STOCK_UA}, timeout=10)
-        result = ((r.json().get("chart") or {}).get("result") or [None])[0]
-        if not result:
-            return None
         q = result["indicators"]["quote"][0]
         ts = result.get("timestamp") or []
         closes, highs, lows, vols = [], [], [], []
@@ -315,20 +296,19 @@ def api_analyze():
     code = (request.args.get("code") or "").strip()
     if not code:
         return jsonify({"error": "請提供股票代號"}), 400
-    info = _get_price(code)
-    if not info:
-        return jsonify({"error": f"找不到 {code}，請確認代號正確"}), 404
-
-    # 用打包的對照表覆蓋成中文名（Yahoo 備援給的是英文名）
-    info["name"] = STOCK_NAMES.get(code, info["name"])
-
+    # 報價+K線、籌碼、基本面 三路並行（大幅縮短等待）
     with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
-        f_kl = pool.submit(_get_kline, code, info["exchange"])
+        f_q = pool.submit(_yahoo_quote, code)
         f_chip = pool.submit(_get_chip, code)
         f_fund = pool.submit(_get_fundamental, code)
-        kl = f_kl.result()
+        info, kl = f_q.result()
         chip = f_chip.result()
         fund = f_fund.result()
+
+    if not info:
+        return jsonify({"error": f"找不到 {code}，請確認代號正確"}), 404
+    # 中文名（打包對照表）
+    info["name"] = STOCK_NAMES.get(code, code)
 
     prev = info.get("prev") or 0
     chg_pct = round((info["price"] - prev) / prev * 100, 2) if prev else 0
@@ -382,7 +362,7 @@ def api_analyze():
     analysis = {}
     try:
         resp = claude_client.messages.create(
-            model="claude-sonnet-4-6", max_tokens=1200,
+            model="claude-haiku-4-5-20251001", max_tokens=1200,
             messages=[{"role": "user", "content": prompt}])
         text = resp.content[0].text
         m = re.search(r"\{[\s\S]*\}", text)
