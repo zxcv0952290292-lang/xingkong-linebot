@@ -201,13 +201,16 @@ def _yahoo_quote(code):
             price = meta.get("regularMarketPrice")
             if not price:
                 continue
+            kl = _kline_from_result(result)
+            # 昨收：用 K 線倒數第二根收盤最準（Yahoo meta 的 previousClose 在長區間會抓到區間起點）
+            prev = (kl or {}).get("_prev_close") or meta.get("previousClose") or 0
             info = {
                 "name": code,  # 中文名稍後由對照表覆蓋
                 "price": float(price),
-                "prev": float(meta.get("chartPreviousClose") or meta.get("previousClose") or 0),
+                "prev": float(prev or 0),
                 "exchange": exch,
             }
-            return info, _kline_from_result(result)
+            return info, kl
         except Exception:
             pass
     return None, None
@@ -249,6 +252,7 @@ def _kline_from_result(result):
             "support": round(min(lows[-20:]), 1), "resistance": round(max(highs[-20:]), 1),
             "volRatio": round(vols[-1] / avg_vol, 1) if avg_vol > 0 else 1,
             "latestVol": round(vols[-1]),
+            "_prev_close": closes[-2] if n >= 2 else None,
         }
     except Exception:
         return None
