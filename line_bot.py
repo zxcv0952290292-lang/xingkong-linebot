@@ -419,6 +419,40 @@ def api_vote():
     }], "module")
     return jsonify({"ok": True, "up": cur.get("up", 0), "down": cur.get("down", 0)})
 
+@app.route("/api/backtest")
+def api_backtest():
+    """歷史推薦戰績回測，彙總 push_history 已回填的 return_pct。"""
+    if not supa.enabled():
+        return jsonify({"samples": 0, "error": "db 未設定"})
+    rows = supa.select("push_history",
+        "select=push_date,code,name,return_pct&return_pct=not.is.null&order=push_date.desc&limit=2000")
+    rets = [r["return_pct"] for r in rows if r.get("return_pct") is not None]
+    n = len(rets)
+    if n == 0:
+        return jsonify({"samples": 0})
+    wins = sum(1 for x in rets if x > 0)
+    dates = sorted(set(r["push_date"] for r in rows))
+    best = max(rows, key=lambda r: r["return_pct"])
+    worst = min(rows, key=lambda r: r["return_pct"])
+    buckets = {"lt-10": 0, "n10-0": 0, "p0-10": 0, "p10-20": 0, "gt20": 0}
+    for x in rets:
+        if x < -10: buckets["lt-10"] += 1
+        elif x < 0: buckets["n10-0"] += 1
+        elif x < 10: buckets["p0-10"] += 1
+        elif x < 20: buckets["p10-20"] += 1
+        else: buckets["gt20"] += 1
+    return jsonify({
+        "samples": n, "days": len(dates),
+        "date_from": dates[0], "date_to": dates[-1],
+        "win_rate": round(wins / n * 100, 1),
+        "avg_return": round(sum(rets) / n, 2),
+        "best": {"name": best.get("name") or best["code"], "code": best["code"], "ret": best["return_pct"]},
+        "worst": {"name": worst.get("name") or worst["code"], "code": worst["code"], "ret": worst["return_pct"]},
+        "buckets": buckets,
+        "recent": [{"date": r["push_date"], "name": r.get("name") or r["code"],
+                    "code": r["code"], "ret": r["return_pct"]} for r in rows[:12]],
+    })
+
 @app.route("/")
 def index():
     return "小星空 online ⭐", 200
