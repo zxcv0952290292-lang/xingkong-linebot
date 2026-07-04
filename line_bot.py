@@ -163,15 +163,36 @@ def reply_message(reply_token, text):
 #   /api/analyze 一直 404。移到這個 Render 持久服務就不會被洗掉。）
 # ══════════════════════════════════════════════════════════════
 STOCK_UA = "Mozilla/5.0"
+FINMIND = "https://api.finmindtrade.com/api/v4/data"
+
+# 台股代號→中文名對照表（打包成靜態檔，Render 離線也查得到）
+try:
+    with open(os.path.join(BASE, "stock_names.json"), encoding="utf-8") as _f:
+        STOCK_NAMES = json.load(_f)
+    print(f"[stock_names] 載入 {len(STOCK_NAMES)} 檔中文名")
+except Exception as _e:
+    STOCK_NAMES = {}
+    print(f"[stock_names] 載入失敗: {_e}")
+
+def _finmind(dataset, code, days=12):
+    """FinMind 開放 API（全球可存取，含台灣以外機房），失敗回空 list。"""
+    start = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+    try:
+        r = requests.get(FINMIND, params={"dataset": dataset, "data_id": code, "start_date": start}, timeout=12)
+        if r.status_code == 200:
+            return r.json().get("data") or []
+    except Exception:
+        pass
+    return []
 
 def _get_price(code):
-    # 先試 TWSE 即時報價（有中文名、盤中即時）——但非台灣 IP（如 Render 新加坡機房）常抓不到
+    # 先試 TWSE 即時報價（盤中即時）——但非台灣 IP（如 Render 新加坡機房）抓不到，超時設短一點
     for ex in ("tse", "otc"):
         try:
             r = requests.get(
                 "https://mis.twse.com.tw/stock/api/getStockInfo.jsp",
                 params={"ex_ch": f"{ex}_{code}.tw", "json": "1", "delay": "0"},
-                timeout=8)
+                timeout=4)
             d = (r.json().get("msgArray") or [None])[0]
             if d and d.get("z") and d["z"] != "-":
                 prev = d.get("y")
@@ -251,57 +272,37 @@ def _get_kline(code, exchange):
     except Exception:
         return None
 
-def _recent_trading_dates(n=7):
-    out, d = [], datetime.now()
-    while len(out) < n:
-        if d.weekday() < 5:  # 週一~週五
-            out.append({"yyyymmdd": d.strftime("%Y%m%d"),
-                        "twDate": f"{d.year - 1911}/{d.strftime('%m')}/{d.strftime('%d')}"})
-        d -= timedelta(days=1)
-    return out
+def _get_chip(code):
+    """三大法人買賣超（FinMind，全球可用，上市櫃通用）。回傳單位：張。"""
+    data = _finmind("TaiwanStockInstitutionalInvestorsBuySell", code, 14)
+    if not data:
+        return None
+    last_date = max(r["date"] for r in data)
+    agg = {"foreign": 0.0, "trust": 0.0, "dealer": 0.0}
+    for r in data:
+        if r["date"] != last_date:
+            continue
+        net = (r.get("buy", 0) - r.get("sell", 0)) / 1000  # 股 → 張
+        n = r.get("name", "")
+        if "Foreign" in n:
+            agg["foreign"] += net
+        elif "Trust" in n:
+            agg["trust"] += net
+        elif "Dealer" in n:
+            agg["dealer"] += net
+    total = agg["foreign"] + agg["trust"] + agg["dealer"]
+    return {"foreign": round(agg["foreign"]), "trust": round(agg["trust"]),
+            "dealer": round(agg["dealer"]), "total": round(total),
+            "date": last_date.replace("-", "")}
 
-def _get_chip_tse(code):
-    for dt in _recent_trading_dates(7):
-        try:
-            r = requests.get("https://www.twse.com.tw/fund/T86",
-                params={"response": "json", "date": dt["yyyymmdd"], "selectType": "ALLBUT0999"},
-                timeout=10)
-            for row in (r.json().get("data") or []):
-                if row[0].strip() == code:
-                    iv = lambda x: int(str(x).replace(",", ""))
-                    return {"foreign": round(iv(row[4]) / 1000), "trust": round(iv(row[10]) / 1000),
-                            "dealer": round(iv(row[11]) / 1000), "total": round(iv(row[18]) / 1000),
-                            "date": dt["yyyymmdd"]}
-        except Exception:
-            pass
-    return None
-
-def _get_fundamental_tse(code):
-    for dt in _recent_trading_dates(7):
-        try:
-            r = requests.get("https://www.twse.com.tw/exchangeReport/BWIBBU_d",
-                params={"response": "json", "date": dt["yyyymmdd"], "selectType": "ALL"}, timeout=10)
-            for row in (r.json().get("data") or []):
-                if row[0].strip() == code:
-                    return {"pe": row[5], "pb": row[6], "yield": row[3], "date": dt["yyyymmdd"]}
-        except Exception:
-            pass
-    return None
-
-def _get_fundamental_otc(code):
-    for dt in _recent_trading_dates(7):
-        try:
-            r = requests.get("https://www.tpex.org.tw/web/stock/aftertrading/peratio_analysis/pera_result.php",
-                params={"l": "zh-tw", "d": dt["twDate"], "stkno": code, "_": "1"},
-                headers={"User-Agent": STOCK_UA}, timeout=10)
-            j = r.json()
-            rows = ((j.get("tables") or [{}])[0].get("data")) or j.get("aaData") or []
-            for row in rows:
-                if str(row[0]).strip() == code:
-                    return {"pe": row[2], "pb": row[6], "yield": row[5], "date": dt["yyyymmdd"]}
-        except Exception:
-            pass
-    return None
+def _get_fundamental(code):
+    """本益比/股價淨值比/殖利率（FinMind TaiwanStockPER，全球可用，上市櫃通用）。"""
+    data = _finmind("TaiwanStockPER", code, 14)
+    if not data:
+        return None
+    last = data[-1]
+    return {"pe": last.get("PER"), "pb": last.get("PBR"),
+            "yield": last.get("dividend_yield"), "date": (last.get("date") or "").replace("-", "")}
 
 @app.after_request
 def _api_cors(resp):
@@ -318,13 +319,15 @@ def api_analyze():
     if not info:
         return jsonify({"error": f"找不到 {code}，請確認代號正確"}), 404
 
-    is_listed = info["exchange"] == "上市"
+    # 用打包的對照表覆蓋成中文名（Yahoo 備援給的是英文名）
+    info["name"] = STOCK_NAMES.get(code, info["name"])
+
     with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
         f_kl = pool.submit(_get_kline, code, info["exchange"])
-        f_chip = pool.submit(_get_chip_tse, code) if is_listed else None
-        f_fund = pool.submit(_get_fundamental_tse if is_listed else _get_fundamental_otc, code)
+        f_chip = pool.submit(_get_chip, code)
+        f_fund = pool.submit(_get_fundamental, code)
         kl = f_kl.result()
-        chip = f_chip.result() if f_chip else None
+        chip = f_chip.result()
         fund = f_fund.result()
 
     prev = info.get("prev") or 0
@@ -339,7 +342,7 @@ def api_analyze():
         chip_text = (f"外資:{sgn(chip['foreign'])}張 投信:{sgn(chip['trust'])}張 自營:{sgn(chip['dealer'])}張 "
                      f"三大法人合計:{sgn(chip['total'])}張（{chip['date']}）")
     else:
-        chip_text = "上市籌碼當日暫無，請稍後再試" if is_listed else "上櫃三大法人資料暫無"
+        chip_text = "三大法人資料暫無"
     fund_text = (f"本益比:{fund['pe']} 股價淨值比:{fund['pb']} 殖利率:{fund['yield']}%（{fund['date']}）"
                  if fund else "基本面資料暫無")
 
@@ -394,6 +397,26 @@ def api_analyze():
         "kline": kl, "chip": chip, "fundamental": fund,
         **analysis,  # story/technical/chip/fundamental(文字)/suggestion/entry... 覆蓋原始物件
     })
+
+@app.route("/api/vote", methods=["GET", "POST"])
+def api_vote():
+    """每日推播的看多/看空投票，累計存 Supabase。"""
+    vote = (request.args.get("vote") or "").strip()
+    date = (request.args.get("date") or datetime.now().strftime("%Y-%m-%d")).replace("/", "-")
+    if vote not in ("up", "down"):
+        return jsonify({"error": "vote 只能是 up 或 down"}), 400
+    if not supa.enabled():
+        return jsonify({"ok": False, "reason": "db 未設定"})
+    key = f"stock_vote_{date}"
+    rows = supa.select("module_status", f"module=eq.{key}&select=extras")
+    cur = (rows[0].get("extras") if rows else None) or {}
+    cur[vote] = int(cur.get(vote, 0)) + 1
+    supa.upsert("module_status", [{
+        "module": key,
+        "last_run": datetime.now().strftime("%Y-%m-%dT%H:%M:%S") + "+08:00",
+        "status": "vote", "extras": cur,
+    }], "module")
+    return jsonify({"ok": True, "up": cur.get("up", 0), "down": cur.get("down", 0)})
 
 @app.route("/")
 def index():

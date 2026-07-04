@@ -7,6 +7,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY line_bot.py .
 COPY supa.py .
+COPY stock_names.json .
 
 ENV PORT=8080
 EXPOSE 8080
