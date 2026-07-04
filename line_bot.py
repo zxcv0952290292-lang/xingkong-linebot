@@ -165,6 +165,7 @@ def reply_message(reply_token, text):
 STOCK_UA = "Mozilla/5.0"
 
 def _get_price(code):
+    # 先試 TWSE 即時報價（有中文名、盤中即時）——但非台灣 IP（如 Render 新加坡機房）常抓不到
     for ex in ("tse", "otc"):
         try:
             r = requests.get(
@@ -179,6 +180,24 @@ def _get_price(code):
                     "price": float(d["z"]),
                     "prev": float(prev) if prev not in (None, "-", "") else 0,
                     "exchange": "上市" if ex == "tse" else "上櫃",
+                }
+        except Exception:
+            pass
+    # 備援：Yahoo Finance（全球可存取，Render 也抓得到；名稱為英文）
+    for suf, exch in ((".TW", "上市"), (".TWO", "上櫃")):
+        try:
+            r = requests.get(
+                f"https://query1.finance.yahoo.com/v8/finance/chart/{code}{suf}",
+                params={"interval": "1d", "range": "5d"},
+                headers={"User-Agent": STOCK_UA}, timeout=10)
+            m = (((r.json().get("chart") or {}).get("result") or [{}])[0]).get("meta") or {}
+            price = m.get("regularMarketPrice")
+            if price:
+                return {
+                    "name": m.get("shortName") or m.get("longName") or code,
+                    "price": float(price),
+                    "prev": float(m.get("chartPreviousClose") or m.get("previousClose") or 0),
+                    "exchange": exch,
                 }
         except Exception:
             pass
