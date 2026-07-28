@@ -95,6 +95,31 @@ def upsert(table: str, rows: list, on_conflict: str) -> bool:
         return False
 
 
+def update(table: str, query: str, patch: dict) -> bool:
+    """只改指定欄位（PATCH），其他欄位保持不動。query 例：id=eq.8
+
+    ⚠️ 不要用 upsert 來「改幾個欄位」——upsert 走的是 POST，沒帶到的欄位會被寫成 NULL，
+    撞到 NOT NULL 就整批失敗（2026-07-13 回填 push_history.return_pct 時踩過：
+    錯誤 23502，push_date 被寫成 null）。改欄位一律用這支。
+    """
+    if not enabled() or not patch:
+        return False
+    try:
+        r = requests.patch(
+            f"{URL}/rest/v1/{table}?{query}",
+            headers=_headers("return=minimal"),
+            data=json.dumps(patch, ensure_ascii=False).encode("utf-8"),
+            timeout=10,
+        )
+        if r.status_code >= 300:
+            print(f"[supa] update {table} 失敗 {r.status_code}: {r.text[:150]}")
+            return False
+        return True
+    except Exception as e:
+        print(f"[supa] update {table} 例外: {e}")
+        return False
+
+
 def select(table: str, query: str = "") -> list:
     """查詢，query 為 PostgREST 參數字串（例：user_id=eq.U123&limit=10）。"""
     if not enabled():

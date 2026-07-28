@@ -11,6 +11,9 @@ import re
 import math
 import concurrent.futures
 import anthropic
+import uuid
+import time
+import threading
 from collections import defaultdict, deque
 from datetime import datetime, timedelta
 import supa  # Supabase 對話記憶（重啟不忘）
@@ -126,18 +129,35 @@ def build_system_prompt():
     return SYSTEM_PROMPT
 
 def ask_ai(user_id, user_message):
+    """走本機大腦佇列（Supabase 工單 → Mac brain_daemon 用 Claude 訂閱額度跑），
+    不再打 Anthropic API（API 帳戶餘額歸零）。代價：Mac 要醒著、回話約 10-40 秒。"""
     try:
         history = load_history(user_id)
-        messages = history + [{"role": "user", "content": user_message}]
-        response = claude_client.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=500,
-            system=build_system_prompt(),
-            messages=messages
-        )
-        reply = response.content[0].text
-        save_turn(user_id, user_message, reply)
-        return reply
+        convo = "\n".join(
+            f"{'用戶' if m.get('role') == 'user' else '小星空'}：{m.get('content','')}"
+            for m in history)
+        prompt = (build_system_prompt()
+                  + (f"\n\n【最近對話】\n{convo}" if convo else "")
+                  + f"\n\n用戶剛剛說：{user_message}\n\n"
+                  + "請用小星空的語氣回一則 LINE 訊息（繁體中文、100 字內、可用 emoji），只輸出訊息本身。")
+        tid = "ticket:" + str(uuid.uuid4())
+        now = datetime.now().isoformat()
+        ok = supa.insert("module_status", [{
+            "module_name": tid, "last_run": now, "status": "pending",
+            "detail": {"status": "pending", "prompt": prompt, "speed": "fast", "created": now}}])
+        if not ok:
+            return "抱歉，我現在連不上大腦，等等再問我 😅"
+        for _ in range(30):                       # 最多輪詢 ~60 秒
+            time.sleep(2)
+            rows = supa.select("module_status", f"module_name=eq.{tid}&select=detail")
+            d = (rows[0].get("detail") if rows else {}) or {}
+            if d.get("status") == "done":
+                reply = (d.get("result") or "").strip()
+                save_turn(user_id, user_message, reply)
+                return reply or "嗯…我剛剛恍神了，再問我一次好嗎 😅"
+            if d.get("status") == "error":
+                break
+        return "小星空的大腦正在忙，等我一下下再問我一次好嗎 😅"
     except Exception as e:
         notify_owner(f"⚠️ 小星空出錯：{e}")
         return "抱歉，我現在有點問題，請稍後再試 😅"
@@ -632,9 +652,18 @@ def webhook():
             if alert_reply is not None:
                 reply_message(reply_token, alert_reply)
             else:
-                ai_response = ask_ai(user_id, user_message)
-                print(f"[AI回覆]: {ai_response[:80]}")
-                reply_message(reply_token, ai_response)
+                # AI 走本機大腦佇列（10-40s），不能卡住 webhook（LINE 會逾時重送）。
+                # 先秒回一句「思考中」用 reply，真答案在背景算完用 push 送。
+                reply_message(reply_token, "小星空想一下喔 🌟")
+                def _bg(uid, msg):
+                    try:
+                        ans = ask_ai(uid, msg)
+                        print(f"[AI回覆]: {ans[:80]}")
+                        push_message(uid, ans)
+                    except Exception as e:
+                        print(f"[bg err] {e}")
+                        push_message(uid, "抱歉，我剛剛卡住了，再問我一次好嗎 😅")
+                threading.Thread(target=_bg, args=(user_id, user_message), daemon=True).start()
             _write_status("line_bot", "已回覆訊息", {"messages_today": _bump_messages_today()})
 
     return "OK"
