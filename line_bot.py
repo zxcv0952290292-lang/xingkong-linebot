@@ -128,9 +128,28 @@ def build_system_prompt():
         return SYSTEM_PROMPT + f"\n\n【今日推播（{push.get('date','')}）】\n{push.get('content','')[:800]}"
     return SYSTEM_PROMPT
 
+BRAIN_ASLEEP_MSG = "小星空的大腦在家裡睡覺 😴\n（Stanley 的 Mac 沒醒，AI 回話要靠它）\n行情、到價提醒這些還是可以用喔 ⭐"
+
+def brain_awake():
+    """大腦心跳 90 秒內才算醒著。brain_daemon 每次迴圈會更新 brain_heartbeat。
+    先判斷再建單——不然工單丟進去也沒人撈，使用者要枯等 60 秒才拿到誤導的『正在忙』。"""
+    try:
+        rows = supa.select("module_status", "module_name=eq.brain_heartbeat&select=last_run")
+        if not rows:
+            return False
+        ts = (rows[0].get("last_run") or "").replace("Z", "+00:00")
+        last = datetime.fromisoformat(ts)
+        now = datetime.now(last.tzinfo) if last.tzinfo else datetime.now()
+        return (now - last).total_seconds() < 90
+    except Exception as e:
+        print(f"[brain_awake err] {e}")
+        return True          # 判斷不出來就照舊流程走，不要因為這個擋掉功能
+
 def ask_ai(user_id, user_message):
     """走本機大腦佇列（Supabase 工單 → Mac brain_daemon 用 Claude 訂閱額度跑），
     不再打 Anthropic API（API 帳戶餘額歸零）。代價：Mac 要醒著、回話約 10-40 秒。"""
+    if not brain_awake():
+        return BRAIN_ASLEEP_MSG
     try:
         history = load_history(user_id)
         convo = "\n".join(
@@ -157,7 +176,8 @@ def ask_ai(user_id, user_message):
                 return reply or "嗯…我剛剛恍神了，再問我一次好嗎 😅"
             if d.get("status") == "error":
                 break
-        return "小星空的大腦正在忙，等我一下下再問我一次好嗎 😅"
+        # 輪詢逾時：可能是大腦中途睡著，也可能真的塞車——分開講，不要一律說「正在忙」
+        return BRAIN_ASLEEP_MSG if not brain_awake() else "小星空的大腦正在忙，等我一下下再問我一次好嗎 😅"
     except Exception as e:
         notify_owner(f"⚠️ 小星空出錯：{e}")
         return "抱歉，我現在有點問題，請稍後再試 😅"
