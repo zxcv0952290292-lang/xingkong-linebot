@@ -111,12 +111,41 @@ SYSTEM_PROMPT = """你是小星空 ⭐，一個可愛又幽默的 AI 助理，�
 - 回答理財問題時加上小提醒，例如「投資有風險，請量力而為喔！」
 - 如果用戶問到今日推播的股票，你可以參考【今日推播】的內容回答"""
 
+_PUSH_CACHE = {"at": 0, "data": None}
+
+
 def load_last_push():
+    """讀今日推播內容。
+
+    2026-08-22 修正：原本只讀本機的 last_stock_push.json，但這支跑在 Render、
+    寫檔的 twstock_bot 跑在 Stanley 的 Mac —— **兩台不同機器**，而且
+    line_bot_deploy/ 裡根本沒有那個檔，所以「問今日推播」這功能從來沒運作過。
+    改成優先讀 Supabase（twstock_bot 現在會同時寫進去），本機檔案當備援。
+
+    快取 5 分鐘，避免每則訊息都打一次資料庫。
+    """
+    import time as _t
+    if _PUSH_CACHE["data"] and _t.time() - _PUSH_CACHE["at"] < 300:
+        return _PUSH_CACHE["data"]
+
+    data = None
     try:
-        with open(LAST_PUSH_FILE, encoding="utf-8") as f:
-            return json.load(f)
-    except:
-        return None
+        rows = supa.select("module_status",
+                           "module_name=eq.stock_last_push&select=detail")
+        if rows:
+            data = rows[0].get("detail")
+    except Exception as e:
+        print(f"[load_last_push] Supabase 讀取失敗：{e}")
+
+    if not data:                      # 備援：本機檔（本機執行時才會有）
+        try:
+            with open(LAST_PUSH_FILE, encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            data = None
+
+    _PUSH_CACHE.update({"at": _t.time(), "data": data})
+    return data
 
 def verify_signature(body, signature):
     hash = hmac.new(LINE_CHANNEL_SECRET.encode(), body, hashlib.sha256).digest()
