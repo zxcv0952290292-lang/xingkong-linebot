@@ -10,7 +10,6 @@ import os
 import re
 import math
 import concurrent.futures
-import anthropic
 import uuid
 import time
 import threading
@@ -61,12 +60,10 @@ app = Flask(__name__)
 LINE_CHANNEL_SECRET = os.environ["LINE_CHANNEL_SECRET"]
 LINE_CHANNEL_TOKEN = os.environ["LINE_CHANNEL_TOKEN"]
 OWNER_UID = os.environ.get("OWNER_UID", "U6d485aa77b4a6779f61ad7c263e43d65")
-ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 SCAN_TOKEN = os.environ.get("SCAN_TOKEN", "")  # 保護 /tasks/scan_alerts
 BASE = os.path.dirname(os.path.abspath(__file__))
 LAST_PUSH_FILE = os.path.join(BASE, "last_stock_push.json")
 
-claude_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
 # 每位用戶最近 10 則對話記憶
 # ─ Supabase 開啟時存 line_chat_history（重啟不忘）；否則退回記憶體 deque ─
@@ -422,7 +419,6 @@ def scan_alerts():
 #   /api/analyze 一直 404。移到這個 Render 持久服務就不會被洗掉。）
 # ══════════════════════════════════════════════════════════════
 STOCK_UA = "Mozilla/5.0"
-FINMIND = "https://api.finmindtrade.com/api/v4/data"
 
 # 台股代號→中文名對照表（打包成靜態檔，Render 離線也查得到）
 try:
@@ -433,16 +429,6 @@ except Exception as _e:
     STOCK_NAMES = {}
     print(f"[stock_names] 載入失敗: {_e}")
 
-def _finmind(dataset, code, days=12):
-    """FinMind 開放 API（全球可存取，含台灣以外機房），失敗回空 list。"""
-    start = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
-    try:
-        r = requests.get(FINMIND, params={"dataset": dataset, "data_id": code, "start_date": start}, timeout=12)
-        if r.status_code == 200:
-            return r.json().get("data") or []
-    except Exception:
-        pass
-    return []
 
 def _yahoo_quote(code):
     """一次 Yahoo chart 請求同時取得報價與技術指標（省一次網路來回；Yahoo 全球可存取）。
@@ -516,39 +502,8 @@ def _kline_from_result(result):
     except Exception:
         return None
 
-def _get_chip(code):
-    """三大法人買賣超（FinMind，全球可用，上市櫃通用）。回傳單位：張。"""
-    data = _finmind("TaiwanStockInstitutionalInvestorsBuySell", code, 14)
-    if not data:
-        return None
-    last_date = max(r["date"] for r in data)
-    agg = {"foreign": 0.0, "trust": 0.0, "dealer": 0.0}
-    for r in data:
-        if r["date"] != last_date:
-            continue
-        net = (r.get("buy", 0) - r.get("sell", 0)) / 1000  # 股 → 張
-        n = r.get("name", "")
-        if "Foreign" in n:
-            agg["foreign"] += net
-        elif "Trust" in n:
-            agg["trust"] += net
-        elif "Dealer" in n:
-            agg["dealer"] += net
-    total = agg["foreign"] + agg["trust"] + agg["dealer"]
-    return {"foreign": round(agg["foreign"]), "trust": round(agg["trust"]),
-            "dealer": round(agg["dealer"]), "total": round(total),
-            "date": last_date.replace("-", "")}
 
-def _get_fundamental(code):
-    """本益比/股價淨值比/殖利率（FinMind TaiwanStockPER，全球可用，上市櫃通用）。"""
-    data = _finmind("TaiwanStockPER", code, 14)
-    if not data:
-        return None
-    last = data[-1]
-    return {"pe": last.get("PER"), "pb": last.get("PBR"),
-            "yield": last.get("dividend_yield"), "date": (last.get("date") or "").replace("-", "")}
 
-@app.after_request
 def _api_cors(resp):
     if request.path.startswith("/api/"):
         resp.headers["Access-Control-Allow-Origin"] = "*"
@@ -559,14 +514,10 @@ def api_analyze():
     code = (request.args.get("code") or "").strip()
     if not code:
         return jsonify({"error": "請提供股票代號"}), 400
-    # 報價+K線、籌碼、基本面 三路並行（大幅縮短等待）
-    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
-        f_q = pool.submit(_yahoo_quote, code)
-        f_chip = pool.submit(_get_chip, code)
-        f_fund = pool.submit(_get_fundamental, code)
-        info, kl = f_q.result()
-        chip = f_chip.result()
-        fund = f_fund.result()
+    # 2026-08-23：原本三路並行（報價／籌碼／基本面），但後兩路走 FinMind，
+    # 從 Render 機房打出去被限流，回來永遠是 null（實測 2603、2330 都一樣）。
+    # 兩路死的併發沒有意義，直接拿掉——端點也從 3 個外部請求降成 1 個。
+    info, kl = _yahoo_quote(code)
 
     if not info:
         return jsonify({"error": f"找不到 {code}，請確認代號正確"}), 404
@@ -575,70 +526,24 @@ def api_analyze():
 
     prev = info.get("prev") or 0
     chg_pct = round((info["price"] - prev) / prev * 100, 2) if prev else 0
-    chg_str = f"+{chg_pct:.2f}%" if chg_pct >= 0 else f"{chg_pct:.2f}%"
+    # 這三段（k_text / chip_text / fund_text）原本只是用來組 AI 的 prompt，
+    # prompt 拿掉之後就成了孤兒，而且會參照已刪除的 chip / fund → NameError。
 
-    k_text = (f"MA5:{kl['ma5']} MA10:{kl['ma10']} MA20:{kl['ma20']} RSI:{kl['rsi']} MACD:{kl['macd']} "
-              f"布林:{kl['bollDown']}~{kl['bollUp']} 支撐:{kl['support']} 壓力:{kl['resistance']} "
-              f"量比:{kl['volRatio']}x 成交量:{kl['latestVol']}張") if kl else "K線資料不足"
-    if chip:
-        sgn = lambda x: f"+{x}" if x > 0 else f"{x}"
-        chip_text = (f"外資:{sgn(chip['foreign'])}張 投信:{sgn(chip['trust'])}張 自營:{sgn(chip['dealer'])}張 "
-                     f"三大法人合計:{sgn(chip['total'])}張（{chip['date']}）")
-    else:
-        chip_text = "三大法人資料暫無"
-    fund_text = (f"本益比:{fund['pe']} 股價淨值比:{fund['pb']} 殖利率:{fund['yield']}%（{fund['date']}）"
-                 if fund else "基本面資料暫無")
-
-    prompt = f"""你是台股波段分析師。以下是 {code} {info['name']}（{info['exchange']}）完整資料：
-
-現價:{info['price']} 漲跌:{chg_str}
-【技術面】{k_text}
-【籌碼面】{chip_text}
-【基本面】{fund_text}
-
-請給出完整波段分析，輸出純JSON不加代碼框。
-
-【進場價計算規則，必須嚴格遵守】
-- entry 絕對不能等於或高於現價，必須是「值得等待的買進價位」
-- RSI > 70（過熱）：entry = MA20 附近或支撐價，至少比現價低 5% 以上
-- RSI 60~70（偏熱）：entry = MA5 或 MA10 附近，比現價低 2~4%
-- RSI 40~60（中性）：entry = MA5 附近或略低於現價 1~2%
-- RSI < 40（偏弱）：entry = 支撐價附近，或 null（不適合進場）
-- stop_loss 必須低於 entry，設在最近支撐下方 1~2%
-- take_profit 基於波段目標，至少比 entry 高 8% 以上，最多參考壓力位
-
-{{
-  "story": "2~3句說明這檔近期發生什麼事、為何值得或不值得關注",
-  "technical": "均線排列、RSI位置、MACD方向，說明現在處於哪個階段",
-  "chip": "外資投信動向、籌碼是否集中，主力態度如何",
-  "fundamental": "本益比合不合理、殖利率有無吸引力",
-  "suggestion": "進場/觀望/避開，附上一句理由",
-  "entry": 數字或null,
-  "take_profit": 數字或null,
-  "stop_loss": 數字或null,
-  "weeks": "預期持有週數如2~3",
-  "risk": "低/中/高",
-  "risk_note": "最主要的一個風險點",
-  "potential": 1到10整數
-}}"""
-
-    analysis = {}
-    try:
-        resp = claude_client.messages.create(
-            model="claude-haiku-4-5-20251001", max_tokens=1200,
-            messages=[{"role": "user", "content": prompt}])
-        text = resp.content[0].text
-        m = re.search(r"\{[\s\S]*\}", text)
-        if m:
-            analysis = json.loads(m.group(0))
-    except Exception as e:
-        print(f"[api_analyze AI error] {e}")
+    # 2026-08-23：這裡原本把上面組好的資料丟給 Anthropic API 產出
+    # story / technical / chip / fundamental / suggestion / entry / stop_loss…
+    # 兩個問題：
+    #   ① 那個 API 帳戶餘額歸零（全系統早已改走本機訂閱腦），呼叫必定失敗，
+    #      而且失敗被 try 吞掉 → 回傳缺欄位 → 網頁那四格永遠印「–」。
+    #   ② 它產的是進場價／停損停利／操作建議，屬於投資建議；
+    #      Stanley 的保險業務員登錄尚未註銷，那是合規紅線。
+    # 現在網頁自己用數字組出事實描述（見 cf_stock_new 的 sayTech/sayChip/sayFund），
+    # 籌碼與基本面走 /api/stock（自家倉庫＋交易所正本），這支只負責報價與 K 線。
 
     return jsonify({
         "code": code, "name": info["name"], "exchange": info["exchange"],
         "price": info["price"], "change_pct": chg_pct,
-        "kline": kl, "chip": chip, "fundamental": fund,
-        **analysis,  # story/technical/chip/fundamental(文字)/suggestion/entry... 覆蓋原始物件
+        "kline": kl,
+        "note": "籌碼與基本面請走 ferryman-stock 的 /api/stock；本端點只提供報價與 K 線。",
     })
 
 @app.route("/api/vote", methods=["GET", "POST"])
