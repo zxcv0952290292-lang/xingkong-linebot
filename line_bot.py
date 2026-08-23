@@ -72,7 +72,10 @@ CC_PREFIX = "星空"
 
 def cc_put(text: str, media: str = "text", message_id: str = "") -> int:
     """投一封進星空信箱。回傳投完之後信箱裡的未讀數（回覆時告訴他堆了幾封）。"""
-    now = datetime.now().isoformat()
+    # ⚠️ Render 跑在 UTC，datetime.now() 不帶時區的話存進去是 UTC，
+    # 而本機取件與中樞顯示都用台灣時間——2026-08-23 第一次實測就看到
+    # 「18:04 傳的訊息顯示 10:04」。整條鏈路一律存台灣時間。
+    now = (datetime.utcnow() + timedelta(hours=8)).isoformat(timespec="seconds")
     supa.insert("job_queue", [{
         "id": str(uuid.uuid4()), "tenant_id": "stanley",
         "kind": "cc_inbox", "status": "pending",
