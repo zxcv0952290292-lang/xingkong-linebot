@@ -16,7 +16,9 @@ import time
 import threading
 from collections import defaultdict, deque
 from datetime import datetime, timedelta
+os.environ.setdefault("TENANT_SCOPE", "1")  # 雲端沒有 .env，租戶隔離開關用環境變數
 import supa  # Supabase 對話記憶（重啟不忘）
+import inbox as m1  # M1 訊息與名單：非主人的訊息走規則自動回（設定在 tenants.config）
 
 # ─── shared status logger（雲端寫 /tmp，Log 中會列印）───────
 _STATUS_FILE = os.environ.get("STATUS_FILE", "/tmp/status.json")
@@ -210,6 +212,55 @@ def ask_ai(user_id, user_message):
     except Exception as e:
         notify_owner(f"⚠️ 小星空出錯：{e}")
         return "抱歉，我現在有點問題，請稍後再試 😅"
+
+# ── M1 訊息與名單：規則設定從 tenants.config 讀（tenant.py --push 推上來的）──
+_INBOX_CACHE = {"at": 0, "cfg": None}
+
+def _inbox_cfg():
+    """讀 M1 規則設定，快取 5 分鐘。讀不到回 None（呼叫端要有備援）。"""
+    if _INBOX_CACHE["cfg"] and time.time() - _INBOX_CACHE["at"] < 300:
+        return _INBOX_CACHE["cfg"]
+    try:
+        rows = supa.select("tenants", "id=eq.stanley&select=config", tenant="*")
+        cfg = ((rows[0].get("config") or {}).get("inbox")) if rows else None
+        if cfg and cfg.get("rules") is not None:
+            _INBOX_CACHE.update({"at": time.time(), "cfg": cfg})
+            return cfg
+    except Exception as e:
+        print(f"[inbox cfg err] {e}")
+    return _INBOX_CACHE["cfg"]  # 讀失敗就用上一次的，總比沒有好
+
+def _line_profile_name(uid):
+    """抓 LINE 顯示名稱，抓不到回空字串（不擋流程）。"""
+    try:
+        r = requests.get(f"https://api.line.me/v2/bot/profile/{uid}",
+                         headers={"Authorization": f"Bearer {LINE_CHANNEL_TOKEN}"}, timeout=5)
+        if r.status_code == 200:
+            return r.json().get("displayName", "")
+    except Exception:
+        pass
+    return ""
+
+def m1_handle(user_id, user_message, reply_token):
+    """非主人的訊息：接住→認人→分類→自動回→記錄；該人工的推播叫主人。"""
+    cfg = _inbox_cfg()
+    if not cfg:
+        reply_message(reply_token, "收到你的訊息了，我們會盡快回覆你。")
+        notify_owner(f"🔔 有訪客訊息（M1 設定讀不到，先用備援回覆）\n訪客說：{user_message[:80]}")
+        return
+    try:
+        r = m1.handle("line", user_id, user_message,
+                      name=_line_profile_name(user_id),
+                      tid="stanley", cfg=cfg, quiet=True)
+    except Exception as e:
+        print(f"[m1 err] {e}")
+        reply_message(reply_token, "收到你的訊息了，我們會盡快回覆你。")
+        notify_owner(f"⚠️ M1 出錯：{e}\n訪客說：{user_message[:80]}")
+        return
+    if r.get("reply"):
+        reply_message(reply_token, r["reply"])
+    if r.get("needs_human"):
+        notify_owner(f"🔔 要人工接手\n訪客說：{user_message[:80]}\n（規則：{r.get('rule') or '沒命中'}）")
 
 def notify_owner(msg):
     try:
@@ -669,6 +720,10 @@ def index():
 def health():
     return "OK", 200
 
+@app.route("/version")
+def version():
+    return "2026-08-23-m1", 200
+
 @app.route("/webhook", methods=["POST"])
 def webhook():
     signature = request.headers.get("X-Line-Signature", "")
@@ -692,6 +747,11 @@ def webhook():
             user_message = event["message"]["text"]
             reply_token = event["replyToken"]
             print(f"[用戶訊息]: {user_message}")
+            # 非主人 → M1 訊息與名單（規則自動回；小星空只服務主人）
+            if user_id != OWNER_UID:
+                m1_handle(user_id, user_message, reply_token)
+                _write_status("line_bot", "已回覆訊息", {"messages_today": _bump_messages_today()})
+                continue
             # 先看是不是到價提醒指令，是就直接回、不走 AI
             try:
                 alert_reply = handle_alert_command(user_id, user_message) if supa.enabled() else None
