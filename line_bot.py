@@ -245,18 +245,29 @@ def ask_ai(user_id, user_message):
 _INBOX_CACHE = {"at": 0, "cfg": None}
 
 def _inbox_cfg():
-    """讀 M1 規則設定，快取 5 分鐘。讀不到回 None（呼叫端要有備援）。"""
+    """讀 M1 規則設定，快取 5 分鐘。讀不到回 None（呼叫端要有備援）。
+
+    **停權的租戶不服務**：billing.py 把 status 改成 suspended 之後，
+    這裡讀不到 active 的那筆 → 回 (None, False)，自動回覆整個停掉、
+    只留通知主人。沒繳錢卻照跑，計費就是假的。
+    """
     if _INBOX_CACHE["cfg"] and time.time() - _INBOX_CACHE["at"] < 300:
-        return _INBOX_CACHE["cfg"]
+        return _INBOX_CACHE["cfg"], _INBOX_CACHE.get("active", True)
     try:
-        rows = supa.select("tenants", "id=eq.stanley&select=config", tenant="*")
-        cfg = ((rows[0].get("config") or {}).get("inbox")) if rows else None
-        if cfg and cfg.get("rules") is not None:
-            _INBOX_CACHE.update({"at": time.time(), "cfg": cfg})
-            return cfg
+        rows = supa.select("tenants", "id=eq.stanley&select=config,status", tenant="*")
+        # ⚠️ 讀失敗時 supa.select 回 []，那是「不知道」不是「停權」。
+        # 只有真的讀到一筆、而且它不是 active，才算停權。
+        if rows:
+            cfg = (rows[0].get("config") or {}).get("inbox")
+            if (rows[0].get("status") or "active") != "active":
+                _INBOX_CACHE.update({"at": time.time(), "cfg": cfg, "active": False})
+                return cfg, False
+            if cfg and cfg.get("rules") is not None:
+                _INBOX_CACHE.update({"at": time.time(), "cfg": cfg, "active": True})
+                return cfg, True
     except Exception as e:
         print(f"[inbox cfg err] {e}")
-    return _INBOX_CACHE["cfg"]  # 讀失敗就用上一次的，總比沒有好
+    return _INBOX_CACHE["cfg"], _INBOX_CACHE.get("active", True)  # 讀失敗就用上一次的
 
 def _line_profile_name(uid, token=None):
     """抓 LINE 顯示名稱，抓不到回空字串（不擋流程）。uid 是頻道限定的，要用對的鑰匙查。"""
@@ -272,7 +283,10 @@ def _line_profile_name(uid, token=None):
 def m1_handle(user_id, user_message, reply_token, token=None):
     """訪客訊息：接住→認人→分類→自動回→記錄；該人工的推播叫主人。
     token＝這則訊息來自哪個 OA 就用哪把鑰匙回（None＝小星空）。通知主人永遠走小星空。"""
-    cfg = _inbox_cfg()
+    cfg, active = _inbox_cfg()
+    if not active:
+        notify_owner(f"⏸ 服務停權中，自動回覆沒有送出\n訪客說：{user_message[:80]}")
+        return
     if not cfg:
         reply_message(reply_token, "收到你的訊息了，我們會盡快回覆你。", token=token)
         notify_owner(f"🔔 有訪客訊息（M1 設定讀不到，先用備援回覆）\n訪客說：{user_message[:80]}")
@@ -659,7 +673,7 @@ def health():
 
 @app.route("/version")
 def version():
-    return "2026-08-23-ferryman-oa", 200
+    return "2026-08-23-billing-suspend", 200
 
 @app.route("/webhook/ferryman", methods=["POST"])
 def webhook_ferryman():
