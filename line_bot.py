@@ -59,6 +59,9 @@ app = Flask(__name__)
 
 LINE_CHANNEL_SECRET = os.environ["LINE_CHANNEL_SECRET"]
 LINE_CHANNEL_TOKEN = os.environ["LINE_CHANNEL_TOKEN"]
+# 擺渡人 OA（@078jnspi）——對客的帳號。兩把鑰匙放 Render 環境變數；沒設＝這條路關著（404）。
+FERRYMAN_CHANNEL_SECRET = os.environ.get("FERRYMAN_CHANNEL_SECRET", "")
+FERRYMAN_CHANNEL_TOKEN = os.environ.get("FERRYMAN_CHANNEL_TOKEN", "")
 OWNER_UID = os.environ.get("OWNER_UID", "U6d485aa77b4a6779f61ad7c263e43d65")
 
 # ── 星空信箱（2026-08-23）────────────────────────────────────
@@ -174,8 +177,8 @@ def load_last_push():
     _PUSH_CACHE.update({"at": _t.time(), "data": data})
     return data
 
-def verify_signature(body, signature):
-    hash = hmac.new(LINE_CHANNEL_SECRET.encode(), body, hashlib.sha256).digest()
+def verify_signature(body, signature, secret=None):
+    hash = hmac.new((secret or LINE_CHANNEL_SECRET).encode(), body, hashlib.sha256).digest()
     return base64.b64encode(hash).decode() == signature
 
 def build_system_prompt():
@@ -255,35 +258,36 @@ def _inbox_cfg():
         print(f"[inbox cfg err] {e}")
     return _INBOX_CACHE["cfg"]  # 讀失敗就用上一次的，總比沒有好
 
-def _line_profile_name(uid):
-    """抓 LINE 顯示名稱，抓不到回空字串（不擋流程）。"""
+def _line_profile_name(uid, token=None):
+    """抓 LINE 顯示名稱，抓不到回空字串（不擋流程）。uid 是頻道限定的，要用對的鑰匙查。"""
     try:
         r = requests.get(f"https://api.line.me/v2/bot/profile/{uid}",
-                         headers={"Authorization": f"Bearer {LINE_CHANNEL_TOKEN}"}, timeout=5)
+                         headers={"Authorization": f"Bearer {token or LINE_CHANNEL_TOKEN}"}, timeout=5)
         if r.status_code == 200:
             return r.json().get("displayName", "")
     except Exception:
         pass
     return ""
 
-def m1_handle(user_id, user_message, reply_token):
-    """非主人的訊息：接住→認人→分類→自動回→記錄；該人工的推播叫主人。"""
+def m1_handle(user_id, user_message, reply_token, token=None):
+    """訪客訊息：接住→認人→分類→自動回→記錄；該人工的推播叫主人。
+    token＝這則訊息來自哪個 OA 就用哪把鑰匙回（None＝小星空）。通知主人永遠走小星空。"""
     cfg = _inbox_cfg()
     if not cfg:
-        reply_message(reply_token, "收到你的訊息了，我們會盡快回覆你。")
+        reply_message(reply_token, "收到你的訊息了，我們會盡快回覆你。", token=token)
         notify_owner(f"🔔 有訪客訊息（M1 設定讀不到，先用備援回覆）\n訪客說：{user_message[:80]}")
         return
     try:
         r = m1.handle("line", user_id, user_message,
-                      name=_line_profile_name(user_id),
+                      name=_line_profile_name(user_id, token=token),
                       tid="stanley", cfg=cfg, quiet=True)
     except Exception as e:
         print(f"[m1 err] {e}")
-        reply_message(reply_token, "收到你的訊息了，我們會盡快回覆你。")
+        reply_message(reply_token, "收到你的訊息了，我們會盡快回覆你。", token=token)
         notify_owner(f"⚠️ M1 出錯：{e}\n訪客說：{user_message[:80]}")
         return
     if r.get("reply"):
-        reply_message(reply_token, r["reply"])
+        reply_message(reply_token, r["reply"], token=token)
     if r.get("needs_human"):
         notify_owner(f"🔔 要人工接手\n訪客說：{user_message[:80]}\n（規則：{r.get('rule') or '沒命中'}）")
 
@@ -295,10 +299,10 @@ def notify_owner(msg):
     except:
         pass
 
-def reply_message(reply_token, text):
+def reply_message(reply_token, text, token=None):
     res = requests.post(
         "https://api.line.me/v2/bot/message/reply",
-        headers={"Content-Type": "application/json", "Authorization": f"Bearer {LINE_CHANNEL_TOKEN}"},
+        headers={"Content-Type": "application/json", "Authorization": f"Bearer {token or LINE_CHANNEL_TOKEN}"},
         json={"replyToken": reply_token, "messages": [{"type": "text", "text": text}]}
     )
     print(f"[LINE回覆狀態]: {res.status_code} {res.text}")
@@ -655,7 +659,30 @@ def health():
 
 @app.route("/version")
 def version():
-    return "2026-08-23-inbox-tz", 200
+    return "2026-08-23-ferryman-oa", 200
+
+@app.route("/webhook/ferryman", methods=["POST"])
+def webhook_ferryman():
+    """擺渡人 OA（@078jnspi）——純對客帳號：所有訊息一律走 M1，這裡沒有小星空。
+    鑰匙沒設就當這條路不存在（404），部署了也不會誤接。"""
+    if not FERRYMAN_CHANNEL_SECRET or not FERRYMAN_CHANNEL_TOKEN:
+        abort(404)
+    signature = request.headers.get("X-Line-Signature", "")
+    body = request.get_data(as_text=True)
+    if not verify_signature(body.encode(), signature, secret=FERRYMAN_CHANNEL_SECRET):
+        print("[ferryman] 簽名驗證失敗")
+        abort(400)
+    for event in json.loads(body).get("events", []):
+        if event["type"] == "follow":
+            reply_message(event["replyToken"],
+                          "嗨，我是擺渡人。\n想了解存錢挑戰，回「報名」就可以。\n其他事慢慢說，我都會看到。",
+                          token=FERRYMAN_CHANNEL_TOKEN)
+        elif event["type"] == "message" and event["message"]["type"] == "text":
+            m1_handle(event["source"].get("userId", "unknown"),
+                      event["message"]["text"], event["replyToken"],
+                      token=FERRYMAN_CHANNEL_TOKEN)
+            _write_status("line_bot", "擺渡人OA已回覆", {"messages_today": _bump_messages_today()})
+    return "OK"
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
