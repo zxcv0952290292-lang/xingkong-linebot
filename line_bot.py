@@ -655,7 +655,7 @@ def health():
 
 @app.route("/version")
 def version():
-    return "2026-08-23-inbox", 200
+    return "2026-08-23-inbox-tz", 200
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
