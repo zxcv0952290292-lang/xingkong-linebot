@@ -60,6 +60,31 @@ app = Flask(__name__)
 LINE_CHANNEL_SECRET = os.environ["LINE_CHANNEL_SECRET"]
 LINE_CHANNEL_TOKEN = os.environ["LINE_CHANNEL_TOKEN"]
 OWNER_UID = os.environ.get("OWNER_UID", "U6d485aa77b4a6779f61ad7c263e43d65")
+
+# ── 星空信箱（2026-08-23）────────────────────────────────────
+# Stanley 2026-07-12 在 LINE 上問過「你能幫我轉達給終端的星空嗎」，當時答不行。
+# 其實管線都在了，缺的只是一個標記：主人打「星空 ……」開頭，就不走 AI，
+# 直接投進 job_queue（kind=cc_inbox），終端機那邊的 Claude Code 自己來拿。
+# 附件（圖／語音／影片）只記 messageId，本機拿 channel token 自己去 LINE 抓原檔
+# ——webhook 不下載，才不會卡住（LINE 逾時會重送）。
+CC_PREFIX = "星空"
+
+
+def cc_put(text: str, media: str = "text", message_id: str = "") -> int:
+    """投一封進星空信箱。回傳投完之後信箱裡的未讀數（回覆時告訴他堆了幾封）。"""
+    now = datetime.now().isoformat()
+    supa.insert("job_queue", [{
+        "id": str(uuid.uuid4()), "tenant_id": "stanley",
+        "kind": "cc_inbox", "status": "pending",
+        "payload": {"text": text, "media": media, "message_id": message_id,
+                    "from": "line", "at": now},
+    }])
+    try:
+        rows = supa.select("job_queue",
+                           "status=eq.pending&kind=eq.cc_inbox&select=id")
+        return len(rows or [])
+    except Exception:
+        return 0
 SCAN_TOKEN = os.environ.get("SCAN_TOKEN", "")  # 保護 /tasks/scan_alerts
 BASE = os.path.dirname(os.path.abspath(__file__))
 LAST_PUSH_FILE = os.path.join(BASE, "last_stock_push.json")
@@ -627,7 +652,7 @@ def health():
 
 @app.route("/version")
 def version():
-    return "2026-08-23-m1", 200
+    return "2026-08-23-inbox", 200
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
@@ -657,6 +682,22 @@ def webhook():
                 m1_handle(user_id, user_message, reply_token)
                 _write_status("line_bot", "已回覆訊息", {"messages_today": _bump_messages_today()})
                 continue
+            # 「星空 ……」＝要給終端機那邊的 Claude Code，不走 AI、不花額度
+            if user_message.startswith(CC_PREFIX):
+                body_text = user_message[len(CC_PREFIX):].strip(" 　:：,，")
+                if body_text:
+                    try:
+                        n = cc_put(body_text)
+                        reply_message(reply_token,
+                                      f"📮 收到，已放進星空的信箱（未讀 {n} 封）\n"
+                                      f"他在電腦前的話會馬上看到；沒開機就等下次開工。")
+                    except Exception as e:
+                        print(f"[cc_put err] {e}")
+                        reply_message(reply_token, "📮 信箱寫不進去，等等再試一次 😅")
+                    _write_status("line_bot", "已回覆訊息",
+                                  {"messages_today": _bump_messages_today()})
+                    continue
+
             # 先看是不是到價提醒指令，是就直接回、不走 AI
             try:
                 alert_reply = handle_alert_command(user_id, user_message) if supa.enabled() else None
@@ -678,6 +719,26 @@ def webhook():
                         print(f"[bg err] {e}")
                         push_message(uid, "抱歉，我剛剛卡住了，再問我一次好嗎 😅")
                 threading.Thread(target=_bg, args=(user_id, user_message), daemon=True).start()
+            _write_status("line_bot", "已回覆訊息", {"messages_today": _bump_messages_today()})
+
+        # 主人傳的圖／語音／影片一律進星空信箱。
+        # 在這之前這些訊息是**整個被忽略**的（只有 type=="text" 進得來），
+        # 所以這裡沒有搶走任何原本的行為。
+        elif (event["type"] == "message"
+              and event["message"]["type"] in ("image", "audio", "video", "file")
+              and event["source"].get("userId") == OWNER_UID):
+            mtype = event["message"]["type"]
+            mid = event["message"]["id"]
+            NAME = {"image": "圖片", "audio": "語音", "video": "影片", "file": "檔案"}
+            try:
+                n = cc_put("", media=mtype, message_id=mid)
+                extra = "（會自動轉成文字）" if mtype == "audio" else ""
+                reply_message(event["replyToken"],
+                              f"📮 {NAME[mtype]}收到了{extra}，已放進星空的信箱（未讀 {n} 封）\n"
+                              f"⚠️ LINE 的原檔不會永久保存，他太久沒開機的話附件可能會過期。")
+            except Exception as e:
+                print(f"[cc_put media err] {e}")
+                reply_message(event["replyToken"], "📮 附件收不進信箱，等等再試 😅")
             _write_status("line_bot", "已回覆訊息", {"messages_today": _bump_messages_today()})
 
     return "OK"
