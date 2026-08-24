@@ -673,7 +673,7 @@ def health():
 
 @app.route("/version")
 def version():
-    return "2026-08-23-billing-suspend", 200
+    return "2026-08-24-tenant0-welcome", 200
 
 @app.route("/webhook/ferryman", methods=["POST"])
 def webhook_ferryman():
@@ -689,7 +689,8 @@ def webhook_ferryman():
     for event in json.loads(body).get("events", []):
         if event["type"] == "follow":
             reply_message(event["replyToken"],
-                          "嗨，我是擺渡人。\n想了解存錢挑戰，回「報名」就可以。\n其他事慢慢說，我都會看到。",
+                          "嗨，我是擺渡人。\n我幫店家把 LINE 官方帳號變成自動接訊息、整理名單的訊息管家。\n"
+                          "想看方案回「方案」，想看它怎麼運作回「示範」。\n其他事慢慢說，我都會看到。",
                           token=FERRYMAN_CHANNEL_TOKEN)
         elif event["type"] == "message" and event["message"]["type"] == "text":
             m1_handle(event["source"].get("userId", "unknown"),
