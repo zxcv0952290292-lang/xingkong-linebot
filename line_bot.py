@@ -673,7 +673,7 @@ def health():
 
 @app.route("/version")
 def version():
-    return "2026-08-24-portal-v3-push", 200
+    return "2026-08-24-richmenu", 200
 
 @app.route("/portal/push", methods=["POST"])
 def portal_push():
@@ -717,6 +717,42 @@ def portal_push():
     except Exception as e:
         print(f"[portal_push 記帳失敗] {e}")
     return jsonify({"ok": True})
+
+
+@app.route("/portal/richmenu", methods=["POST"])
+def portal_richmenu():
+    """圖文選單上架（開店 SOP 積木）：收圖＋格子設定，用該租戶自己的 token 走 LINE API
+    三步：建選單→傳圖→設為預設。HMAC 驗證同 /portal/push。"""
+    body = request.get_data()
+    sig = request.headers.get("X-Portal-Sig", "")
+    key = os.environ.get("SUPABASE_SERVICE_KEY", "")
+    if not key or not hmac.compare_digest(sig, hmac.new(key.encode(), body, hashlib.sha256).hexdigest()):
+        abort(401)
+    d = json.loads(body)
+    tenant = d.get("tenant", "")
+    tok = FERRYMAN_CHANNEL_TOKEN if tenant == "stanley" else os.environ.get(f"LINE_TOKEN_{tenant.upper()}", "")
+    if not tok:
+        return jsonify({"error": f"租戶 {tenant} 的 LINE token 未設定"}), 422
+    H = {"Authorization": f"Bearer {tok}"}
+    # 先清同名舊選單（重複上架不堆垃圾）
+    old = requests.get("https://api.line.me/v2/bot/richmenu/list", headers=H, timeout=10).json()
+    for m in old.get("richmenus", []):
+        if m.get("name") == d["menu"]["name"]:
+            requests.delete(f"https://api.line.me/v2/bot/richmenu/{m['richMenuId']}", headers=H, timeout=10)
+    r1 = requests.post("https://api.line.me/v2/bot/richmenu",
+                       headers={**H, "Content-Type": "application/json"}, json=d["menu"], timeout=15)
+    if r1.status_code >= 300:
+        return jsonify({"error": f"建選單失敗 {r1.status_code}: {r1.text[:200]}"}), 502
+    rid = r1.json()["richMenuId"]
+    img = base64.b64decode(d["image_b64"])
+    r2 = requests.post(f"https://api-data.line.me/v2/bot/richmenu/{rid}/content",
+                       headers={**H, "Content-Type": "image/png"}, data=img, timeout=30)
+    if r2.status_code >= 300:
+        return jsonify({"error": f"傳圖失敗 {r2.status_code}: {r2.text[:200]}"}), 502
+    r3 = requests.post(f"https://api.line.me/v2/bot/user/all/richmenu/{rid}", headers=H, timeout=15)
+    if r3.status_code >= 300:
+        return jsonify({"error": f"設預設失敗 {r3.status_code}: {r3.text[:200]}"}), 502
+    return jsonify({"ok": True, "richMenuId": rid})
 
 
 @app.route("/webhook/ferryman", methods=["POST"])
