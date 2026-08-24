@@ -673,7 +673,51 @@ def health():
 
 @app.route("/version")
 def version():
-    return "2026-08-24-tenant0-welcome", 200
+    return "2026-08-24-portal-v3-push", 200
+
+@app.route("/portal/push", methods=["POST"])
+def portal_push():
+    """客戶中樞的「直接回覆」通道（中樞 v3）。
+
+    CF Pages 不放 LINE token（前端環境，洩漏面太大），所以中樞按「回覆」
+    是打到這裡，由本服務用該租戶自己的 OA token 推播。
+    互認：兩邊都有 SUPABASE_SERVICE_KEY，用它做 HMAC——不新增密鑰。
+    副作用：回覆成功＝這位客人「等你回」自動清掉（回了就是處理了）。
+    """
+    body = request.get_data()
+    sig = request.headers.get("X-Portal-Sig", "")
+    key = os.environ.get("SUPABASE_SERVICE_KEY", "")
+    want = hmac.new(key.encode(), body, hashlib.sha256).hexdigest()
+    if not key or not hmac.compare_digest(sig, want):
+        abort(401)
+    d = json.loads(body)
+    tenant = d.get("tenant", ""); uid = d.get("uid", ""); text = (d.get("text") or "").strip()
+    if not (tenant and uid and text) or len(text) > 1000:
+        return jsonify({"error": "缺欄位或太長"}), 400
+    # 租戶 → 他自己的 OA token。寧可失敗也不能拿別人的帳號替他發話。
+    tok = FERRYMAN_CHANNEL_TOKEN if tenant == "stanley" else os.environ.get(f"LINE_TOKEN_{tenant.upper()}", "")
+    if not tok:
+        return jsonify({"error": f"租戶 {tenant} 的 LINE token 未設定，回覆要先開通"}), 422
+    r = requests.post("https://api.line.me/v2/bot/message/push",
+                      headers={"Content-Type": "application/json", "Authorization": f"Bearer {tok}"},
+                      json={"to": uid, "messages": [{"type": "text", "text": text}]}, timeout=10)
+    if r.status_code >= 300:
+        return jsonify({"error": f"LINE {r.status_code}: {r.text[:120]}"}), 502
+    # 記台帳＋清這位客人的「等你回」
+    try:
+        rows = supa.select("contacts", f"channel_uid=eq.{uid}&select=id", tenant=tenant)
+        cid = rows[0]["id"] if rows else None
+        if cid:
+            supa.insert("conversations", [{
+                "contact_id": cid, "direction": "out", "channel": "line", "text": text,
+                "matched_rule": "portal:manual", "needs_human": False}], tenant=tenant)
+            supa.update("conversations",
+                        f"contact_id=eq.{cid}&direction=eq.in&needs_human=eq.true",
+                        {"needs_human": False}, tenant=tenant)
+    except Exception as e:
+        print(f"[portal_push 記帳失敗] {e}")
+    return jsonify({"ok": True})
+
 
 @app.route("/webhook/ferryman", methods=["POST"])
 def webhook_ferryman():
