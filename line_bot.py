@@ -314,10 +314,16 @@ def notify_owner(msg):
         pass
 
 def reply_message(reply_token, text, token=None):
+    """text 可以是字串，也可以是字串陣列（一次回多則，LINE 上限 5 則）。
+
+    收到多則時 LINE 會照順序顯示，中間有間隔——比塞成一大段好讀，
+    而且「分則」本身就是節奏（第一則講我是誰，第二則才給動作）。
+    """
+    texts = [text] if isinstance(text, str) else list(text)[:5]
     res = requests.post(
         "https://api.line.me/v2/bot/message/reply",
         headers={"Content-Type": "application/json", "Authorization": f"Bearer {token or LINE_CHANNEL_TOKEN}"},
-        json={"replyToken": reply_token, "messages": [{"type": "text", "text": text}]}
+        json={"replyToken": reply_token, "messages": [{"type": "text", "text": t} for t in texts]}
     )
     print(f"[LINE回覆狀態]: {res.status_code} {res.text}")
 
@@ -673,7 +679,7 @@ def health():
 
 @app.route("/version")
 def version():
-    return "2026-08-24-richmenu", 200
+    return "2026-08-25-onboarding3", 200
 
 @app.route("/portal/push", methods=["POST"])
 def portal_push():
@@ -768,10 +774,21 @@ def webhook_ferryman():
         abort(400)
     for event in json.loads(body).get("events", []):
         if event["type"] == "follow":
-            reply_message(event["replyToken"],
-                          "嗨，我是擺渡人。\n我幫店家把 LINE 官方帳號變成自動接訊息、整理名單的訊息管家。\n"
-                          "想看方案回「方案」，想看它怎麼運作回「示範」。\n其他事慢慢說，我都會看到。",
-                          token=FERRYMAN_CHANNEL_TOKEN)
+            # 新人前五分鐘的腳本（見 skill: community-architecture / onboarding.md）
+            # 三個原則：①分兩則給節奏 ②三個選項但只要挑一個 ③第三個選項＝識別問題
+            # 第三題問「哪一行＋最常被問什麼」不是寒暄——答案直接對到 presets/*.json
+            # （ecommerce／service／marketing／food／repair），能決定要示範哪一套規則。
+            reply_message(event["replyToken"], [
+                "嗨，我是擺渡人。\n"
+                "我幫店家把 LINE 官方帳號變成會自己接訊息、整理名單的訊息管家。",
+
+                "三件事，挑一件做就好：\n\n"
+                "① 想先看它怎麼運作 → 回「示範」\n"
+                "② 想知道多少錢 → 回「方案」\n"
+                "③ 想讓我看看你的情況 → 直接跟我說你是做哪一行的、\n"
+                "　　現在最常被客人問到什麼\n\n"
+                "其他事慢慢說，我都會看到。",
+            ], token=FERRYMAN_CHANNEL_TOKEN)
         elif event["type"] == "message" and event["message"]["type"] == "text":
             m1_handle(event["source"].get("userId", "unknown"),
                       event["message"]["text"], event["replyToken"],
