@@ -259,6 +259,12 @@ def _inbox_cfg():
         # 只有真的讀到一筆、而且它不是 active，才算停權。
         if rows:
             cfg = (rows[0].get("config") or {}).get("inbox")
+            # 店主自己在中樞改的值（今天的狀況）住在 config.owner_vars，
+            # 不在 inbox.vars——那段每次 tenant.py --push 都會被本機檔蓋掉。
+            # 不在這裡疊回去，就是「中樞看得到、客人聽不到」。
+            ov = (rows[0].get("config") or {}).get("owner_vars") or {}
+            if cfg and ov:
+                cfg = dict(cfg, vars={**(cfg.get("vars") or {}), **ov})
             if (rows[0].get("status") or "active") != "active":
                 _INBOX_CACHE.update({"at": time.time(), "cfg": cfg, "active": False})
                 return cfg, False
@@ -679,7 +685,7 @@ def health():
 
 @app.route("/version")
 def version():
-    return "2026-08-25-onboarding3", 200
+    return "2026-08-26-ownervars-unsure", 200
 
 @app.route("/portal/push", methods=["POST"])
 def portal_push():
