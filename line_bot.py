@@ -243,6 +243,34 @@ def ask_ai(user_id, user_message):
 
 # ── M1 訊息與名單：規則設定從 tenants.config 讀（tenant.py --push 推上來的）──
 _INBOX_CACHE = {"at": 0, "cfg": None}
+_TENANT_CACHE = {}      # tid → {"at","cfg","active"}
+
+
+def _tenant_cfg(tid):
+    """任何一個租戶的 M1 設定，快取 5 分鐘。fail-open 規則跟 _inbox_cfg 一模一樣：
+    **讀不到＝不知道，不是停權**——資料庫抽風不能讓所有客戶的自動回覆一起啞掉。"""
+    c = _TENANT_CACHE.get(tid)
+    if c and time.time() - c["at"] < 300:
+        return c["cfg"], c["active"]
+    try:
+        rows = supa.select("tenants", f"id=eq.{tid}&select=config,status", tenant="*")
+        if rows:
+            conf = rows[0].get("config") or {}
+            cfg = conf.get("inbox")
+            ov = conf.get("owner_vars") or {}
+            if cfg and ov:
+                cfg = dict(cfg, vars={**(cfg.get("vars") or {}), **ov})
+            active = (rows[0].get("status") or "active") == "active"
+            if cfg and cfg.get("rules") is not None:
+                _TENANT_CACHE[tid] = {"at": time.time(), "cfg": cfg, "active": active}
+                return cfg, active
+            if not active:
+                _TENANT_CACHE[tid] = {"at": time.time(), "cfg": cfg, "active": False}
+                return cfg, False
+    except Exception as e:
+        print(f"[tenant cfg err {tid}] {e}")
+    return (c or {}).get("cfg"), (c or {}).get("active", True)
+
 
 def _inbox_cfg():
     """讀 M1 規則設定，快取 5 分鐘。讀不到回 None（呼叫端要有備援）。
@@ -286,10 +314,11 @@ def _line_profile_name(uid, token=None):
         pass
     return ""
 
-def m1_handle(user_id, user_message, reply_token, token=None):
+def m1_handle(user_id, user_message, reply_token, token=None, tid="stanley"):
     """訪客訊息：接住→認人→分類→自動回→記錄；該人工的推播叫主人。
-    token＝這則訊息來自哪個 OA 就用哪把鑰匙回（None＝小星空）。通知主人永遠走小星空。"""
-    cfg, active = _inbox_cfg()
+    token＝這則訊息來自哪個 OA 就用哪把鑰匙回（None＝小星空）。通知主人永遠走小星空。
+    tid＝這則訊息屬於哪個租戶（一店一個 OA，設定與名單都要分開）。"""
+    cfg, active = _tenant_cfg(tid) if tid != "stanley" else _inbox_cfg()
     if not active:
         notify_owner(f"⏸ 服務停權中，自動回覆沒有送出\n訪客說：{user_message[:80]}")
         return
@@ -300,7 +329,7 @@ def m1_handle(user_id, user_message, reply_token, token=None):
     try:
         r = m1.handle("line", user_id, user_message,
                       name=_line_profile_name(user_id, token=token),
-                      tid="stanley", cfg=cfg, quiet=True)
+                      tid=tid, cfg=cfg, quiet=True)
     except Exception as e:
         print(f"[m1 err] {e}")
         reply_message(reply_token, "收到你的訊息了，我們會盡快回覆你。", token=token)
@@ -309,7 +338,9 @@ def m1_handle(user_id, user_message, reply_token, token=None):
     if r.get("reply"):
         reply_message(reply_token, r["reply"], token=token)
     if r.get("needs_human"):
-        notify_owner(f"🔔 要人工接手\n訪客說：{user_message[:80]}\n（規則：{r.get('rule') or '沒命中'}）")
+        why = r.get("unsure") or f"規則：{r.get('rule') or '沒命中'}"
+        where = "" if tid == "stanley" else f"【{tid}】"
+        notify_owner(f"🔔 {where}要人工接手\n訪客說：{user_message[:80]}\n（{why}）")
 
 def notify_owner(msg):
     try:
@@ -685,7 +716,7 @@ def health():
 
 @app.route("/version")
 def version():
-    return "2026-08-26-ownervars-unsure", 200
+    return "2026-08-26-multitenant", 200
 
 @app.route("/portal/push", methods=["POST"])
 def portal_push():
@@ -800,6 +831,34 @@ def webhook_ferryman():
                       event["message"]["text"], event["replyToken"],
                       token=FERRYMAN_CHANNEL_TOKEN)
             _write_status("line_bot", "擺渡人OA已回覆", {"messages_today": _bump_messages_today()})
+    return "OK"
+
+@app.route("/webhook/t/<tid>", methods=["POST"])
+def webhook_tenant(tid):
+    """一店一條路。開新客戶＝在 Render 加兩個環境變數就好，不用改程式：
+        LINE_SECRET_<租戶大寫>   驗簽（確認訊息真的來自 LINE）
+        LINE_TOKEN_<租戶大寫>    回話（以那家店的身分）
+    鑰匙沒設就當這條路不存在（404）——部署了也不會誤接別人的訊息。
+    ⚠️ tid 直接進 SQL 查詢，所以只收英數與底線，別的一律擋掉。"""
+    if not re.fullmatch(r"[A-Za-z0-9_]{1,32}", tid or ""):
+        abort(404)
+    key = tid.upper()
+    secret = os.environ.get(f"LINE_SECRET_{key}", "")
+    token = os.environ.get(f"LINE_TOKEN_{key}", "")
+    if not secret or not token:
+        abort(404)
+    signature = request.headers.get("X-Line-Signature", "")
+    body = request.get_data(as_text=True)
+    if not verify_signature(body.encode(), signature, secret=secret):
+        print(f"[{tid}] 簽名驗證失敗")
+        abort(400)
+    for event in json.loads(body).get("events", []):
+        if event["type"] == "message" and event["message"]["type"] == "text":
+            m1_handle(event["source"].get("userId", "unknown"),
+                      event["message"]["text"], event["replyToken"],
+                      token=token, tid=tid)
+            _write_status("line_bot", f"{tid} 已回覆",
+                          {"messages_today": _bump_messages_today()})
     return "OK"
 
 @app.route("/webhook", methods=["POST"])
