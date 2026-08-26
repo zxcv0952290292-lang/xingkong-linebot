@@ -322,6 +322,43 @@ def _line_profile_name(uid, token=None):
         pass
     return ""
 
+# ── 知識層的雲端出口 ──────────────────────────────────────
+# knowledge.py 不認識任何模型（ask 是注入的），本機注入 brain.ask、雲端注入這支。
+# ⚠️ 沒有金鑰就回 None——整條路照舊走 fallback 叫人，不會壞掉也不會亂答。
+# 模型用 KNOWLEDGE_MODEL 環境變數換；預設 haiku 是照 2026-08-26 估的成本
+# （一家店月 500 則、48% 走這層 ≈ NT$15/月）。要更準就換 claude-sonnet-5。
+KNOWLEDGE_MODEL = os.environ.get("KNOWLEDGE_MODEL", "claude-haiku-4-5")
+_ANTHROPIC = None
+
+
+def _knowledge_ask(prompt):
+    """給 knowledge.answer 用的模型呼叫。**這支永遠不拋例外**——
+    它掛在客人的即時回覆路徑上，模型抽風不能讓 webhook 跟著倒。"""
+    global _ANTHROPIC
+    key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if not key:
+        return ""
+    if _ANTHROPIC is None:
+        import anthropic
+        _ANTHROPIC = anthropic.Anthropic(api_key=key)
+    r = _ANTHROPIC.messages.create(
+        model=KNOWLEDGE_MODEL, max_tokens=512,
+        messages=[{"role": "user", "content": prompt}])
+    return "".join(b.text for b in r.content if b.type == "text")
+
+
+def _answerer(question, card):
+    """規則答不出來時問知識層。沒金鑰／出任何錯 → None → 照舊叫人。"""
+    if not card or not os.environ.get("ANTHROPIC_API_KEY"):
+        return None
+    try:
+        import knowledge
+        return knowledge.answer(question, card, ask=_knowledge_ask)
+    except Exception as e:
+        print(f"[knowledge] {str(e)[:100]}")
+        return None
+
+
 def m1_handle(user_id, user_message, reply_token, token=None, tid="stanley"):
     """訪客訊息：接住→認人→分類→自動回→記錄；該人工的推播叫主人。
     token＝這則訊息來自哪個 OA 就用哪把鑰匙回（None＝小星空）。通知主人永遠走小星空。
@@ -337,7 +374,7 @@ def m1_handle(user_id, user_message, reply_token, token=None, tid="stanley"):
     try:
         r = m1.handle("line", user_id, user_message,
                       name=_line_profile_name(user_id, token=token),
-                      tid=tid, cfg=cfg, quiet=True)
+                      tid=tid, cfg=cfg, answerer=_answerer, quiet=True)
     except Exception as e:
         print(f"[m1 err] {e}")
         reply_message(reply_token, "收到你的訊息了，我們會盡快回覆你。", token=token)
@@ -724,7 +761,7 @@ def health():
 
 @app.route("/version")
 def version():
-    return "2026-08-26-messenger", 200
+    return "2026-08-26-knowledge-wired", 200
 
 @app.route("/portal/push", methods=["POST"])
 def portal_push():
