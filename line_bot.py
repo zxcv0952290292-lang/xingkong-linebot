@@ -62,6 +62,14 @@ LINE_CHANNEL_TOKEN = os.environ["LINE_CHANNEL_TOKEN"]
 # 擺渡人 OA（@078jnspi）——對客的帳號。兩把鑰匙放 Render 環境變數；沒設＝這條路關著（404）。
 FERRYMAN_CHANNEL_SECRET = os.environ.get("FERRYMAN_CHANNEL_SECRET", "")
 FERRYMAN_CHANNEL_TOKEN = os.environ.get("FERRYMAN_CHANNEL_TOKEN", "")
+
+# ── FB 粉專（Messenger Platform）──────────────────────────────
+# 2026-08-26 他要粉專私訊也自動回。Messenger **有 webhook**，所以是即時的，
+# 不像 IG／Threads 私訊只能輪詢（Meta 不給個人帳號 webhook）。
+# 三把鑰匙都要有，缺一就當這條路不存在（404），跟 ferryman 同一個保護。
+FB_PAGE_TOKEN = os.environ.get("FB_PAGE_TOKEN", "")      # 粉專存取權杖
+FB_VERIFY_TOKEN = os.environ.get("FB_VERIFY_TOKEN", "")  # 掛 webhook 時 Meta 會來對這個字串
+FB_APP_SECRET = os.environ.get("FB_APP_SECRET", "")      # 驗簽（確認真的來自 Meta）
 OWNER_UID = os.environ.get("OWNER_UID", "U6d485aa77b4a6779f61ad7c263e43d65")
 
 # ── 星空信箱（2026-08-23）────────────────────────────────────
@@ -716,7 +724,7 @@ def health():
 
 @app.route("/version")
 def version():
-    return "2026-08-26-multitenant", 200
+    return "2026-08-26-messenger", 200
 
 @app.route("/portal/push", methods=["POST"])
 def portal_push():
@@ -798,10 +806,103 @@ def portal_richmenu():
     return jsonify({"ok": True, "richMenuId": rid})
 
 
+def fb_send(psid: str, text: str) -> bool:
+    """用 Graph API 把訊息送回去。送完讀回狀態碼——不驗證就又是「印了✅其實沒送」。"""
+    try:
+        r = requests.post(
+            "https://graph.facebook.com/v21.0/me/messages",
+            params={"access_token": FB_PAGE_TOKEN},
+            json={"recipient": {"id": psid},
+                  "messaging_type": "RESPONSE",
+                  "message": {"text": text[:2000]}},
+            timeout=15)
+        if r.status_code != 200:
+            print(f"[fb] 送出失敗 {r.status_code}: {r.text[:200]}")
+            return False
+        return True
+    except Exception as e:
+        print(f"[fb] 送出例外：{e}")
+        return False
+
+
+def fb_verify(body: bytes, header_sig: str) -> bool:
+    """Meta 的簽章是 sha256=<hex>，算法跟 LINE 不一樣，不能共用 verify_signature。"""
+    if not header_sig.startswith("sha256="):
+        return False
+    mine = hmac.new(FB_APP_SECRET.encode(), body, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(mine, header_sig.split("=", 1)[1])
+
+
+@app.route("/webhook/messenger", methods=["GET", "POST"])
+def webhook_messenger():
+    """FB 粉專私訊 —— 即時（Messenger Platform 有 webhook）。
+
+    GET  ＝ Meta 掛 webhook 時的挑戰驗證，要把 hub.challenge 原樣回去
+    POST ＝ 真的訊息
+
+    ⚠️ 回覆走 Graph API 的 `me/messages`，不是 LINE 的 replyToken，
+    所以不能直接用 `m1_handle`（那支綁死 LINE 的回覆機制）。
+    這裡直接叫底層的 `m1.handle()`，邏輯一樣、出口不同。
+    """
+    if not FB_PAGE_TOKEN or not FB_VERIFY_TOKEN or not FB_APP_SECRET:
+        abort(404)
+
+    if request.method == "GET":
+        if (request.args.get("hub.mode") == "subscribe"
+                and request.args.get("hub.verify_token") == FB_VERIFY_TOKEN):
+            return request.args.get("hub.challenge", ""), 200
+        return "forbidden", 403
+
+    if not fb_verify(request.get_data(), request.headers.get("X-Hub-Signature-256", "")):
+        print("[fb] 簽名驗證失敗")
+        abort(400)
+
+    data = request.get_json(silent=True) or {}
+    for entry in data.get("entry", []):
+        for ev in entry.get("messaging", []):
+            if ev.get("message", {}).get("is_echo"):
+                continue                      # 自己送的別再處理一次
+            psid = (ev.get("sender") or {}).get("id")
+            text = (ev.get("message") or {}).get("text")
+            if not psid or not text:
+                continue
+            cfg, active = _inbox_cfg()
+            if not active:
+                notify_owner(f"⏸ 服務停權中，粉專自動回覆沒送出\n訪客說：{text[:80]}")
+                continue
+            try:
+                r = m1.handle("facebook", psid, text, tid="stanley",
+                              cfg=cfg, quiet=True)
+            except Exception as e:
+                print(f"[fb m1 err] {e}")
+                fb_send(psid, "收到你的訊息了，我們會盡快回覆你。")
+                notify_owner(f"⚠️ 粉專 M1 出錯：{e}\n訪客說：{text[:80]}")
+                continue
+            if r.get("reply"):
+                ok = fb_send(psid, r["reply"])
+                _write_status("line_bot",
+                              "粉專已回覆" if ok else "粉專回覆失敗",
+                              {"messages_today": _bump_messages_today()})
+            if r.get("needs_human"):
+                why = r.get("unsure") or f"規則：{r.get('rule') or '沒命中'}"
+                notify_owner(f"🔔 粉專要人工接手\n訪客說：{text[:80]}\n（{why}）")
+    return "OK"
+
+
 @app.route("/webhook/ferryman", methods=["POST"])
 def webhook_ferryman():
-    """擺渡人 OA（@078jnspi）——純對客帳號：所有訊息一律走 M1，這裡沒有小星空。
-    鑰匙沒設就當這條路不存在（404），部署了也不會誤接。"""
+    """擺渡人·Stanley OA（**@907ajfor**）——純對客帳號：所有訊息一律走 M1。
+
+    ⚠️ 2026-08-26 更正：原註解寫 `@078jnspi`，那是**存錢挑戰**那個接案 OA，
+    不是這條路綁的帳號。實際綁的是 `@907ajfor`
+    （LINE Developers channel 2011221619，webhook 已開）。
+    註解寫錯帳號會害人查錯地方，這種錯比沒註解更糟。
+
+    鑰匙沒設就當這條路不存在（404），部署了也不會誤接。
+    **404 vs 400 是判斷「鑰匙設了沒」的方法**：
+    線上打這條路回 400（簽章錯）＝鑰匙已設；回 404 ＝鑰匙沒設。
+    2026-08-26 實測回 400，所以 Render 上的環境變數是齊的。
+    """
     if not FERRYMAN_CHANNEL_SECRET or not FERRYMAN_CHANNEL_TOKEN:
         abort(404)
     signature = request.headers.get("X-Line-Signature", "")

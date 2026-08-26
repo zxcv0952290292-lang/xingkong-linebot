@@ -253,7 +253,7 @@ def _upsert_contact(channel: str, uid: str, name: str, r: dict,
 
 def handle(channel: str, uid: str, text: str, name: str = "",
            tid: str | None = None, cfg: "dict | None" = None,
-           quiet: bool = False) -> dict:
+           answerer=None, quiet: bool = False) -> dict:
     """接住一則訊息，跑完認人→分類→回應→記錄，回傳該回什麼。
 
     呼叫端（LINE webhook、之後的 IG）拿 reply 去回；reply 是 None 就不回。
@@ -263,6 +263,17 @@ def handle(channel: str, uid: str, text: str, name: str = "",
     import supa
     cfg = _cfg(tid, cfg)
     r = classify(text, tid, cfg)
+    # 規則答不出來 → 問知識層。answerer 是呼叫端注入的 `f(question, card) -> str|None`
+    # （本機綁 brain.ask、雲端綁 API），這支不認識任何模型。
+    # ⚠️ needs_human 保持 True：知識層給的是「有用的資訊」，不是「這題結案了」。
+    if answerer and not r["rule"] and r["needs_human"]:
+        try:
+            a = answerer(text, str(cfg.get("knowledge") or ""))
+        except Exception as e:
+            print(f"[inbox] 知識層出錯，照原本流程走：{str(e)[:60]}")
+            a = None
+        if a:
+            r = dict(r, reply=a, rule="knowledge")
     cid = _upsert_contact(channel, uid, name, r, tid, cfg)
     supa.insert("conversations", [
         {"contact_id": cid, "direction": "in", "channel": channel,
