@@ -807,7 +807,7 @@ def health():
 
 @app.route("/version")
 def version():
-    return "2026-08-28-reply-carry", 200
+    return "2026-08-28-reply-carry-k2", 200
 
 @app.route("/portal/push", methods=["POST"])
 def portal_push():

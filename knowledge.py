@@ -203,6 +203,17 @@ def answer(question: str, card: str, ask, *, limit: int = MAX_REPLY) -> "str | N
     if len(out) > limit * 2:
         print(f"[knowledge] 答太長（{len(out)} 字），當作沒把握")
         return None
+    # 第一關之後補的（2026-08-28 體檢當場抓到）：模型有時候不吐 NO_ANSWER，
+    # 改成用一句話**自己說自己答不出來**——
+    #     「資料裡沒寫退換／出問題的處理方式，我沒辦法答這題，要請本人親自回覆。」
+    # 這句同時犯兩個錯：① 它其實是「叫人」，卻被 `bench()` 算成「答得出來」，
+    # 覆蓋率因此灌水（moto4 那次 2/6 裡有一則是這種）；
+    # ② 它違反 PROMPT 第 7 條——客人不該看到「資料」「系統」這些字。
+    # **這一關不是要它改口，是把它當成沒答案。**
+    if any(k in out for k in ("資料裡", "資料上", "沒有寫", "沒寫", "我沒辦法答",
+                              "無法回答", "請本人", "親自回覆", "系統")):
+        print(f"[knowledge] 它其實在說自己不知道，當作沒答案：{out[:40]}")
+        return None
     # 第二關：回頭跟知識卡對帳。多花一次呼叫，換掉「自信地編一句」的風險。
     if not grounded(out, card, ask, question=q):
         print(f"[knowledge] 查證沒過，改叫人：{out[:40]}")
