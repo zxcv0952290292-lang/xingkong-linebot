@@ -99,6 +99,52 @@ def cc_put(text: str, media: str = "text", message_id: str = "") -> int:
         return len(rows or [])
     except Exception:
         return 0
+# ── 順風車：本機推不出去的回覆，搭他下一則訊息免費送（2026-08-28）──────
+#
+# 這支 OA 是免費方案，**主動推播一個月只有 200 則**，08-28 當天用完，
+# 之後每一次 push 都是 429。他那邊看到的是：訊息傳進去了、沒有任何回音
+# ——他以為是「電腦開機後沒去讀取」，其實讀了，只是回不了。
+#
+# 但 LINE 的**回覆**（replyToken）不算額度、沒有上限。所以只要他再打一個字，
+# 就把積著的話夾在那一則回覆裡一起送出去，一毛額度都不花。
+#
+# ⚠️ 一次最多夾 4 則：reply 一次上限 5 則，要留一個位子給本來要回的那句。
+CC_OUT = "line_pending"
+
+
+def cc_take_pending(limit: int = 4) -> list:
+    """撈出待送的回覆並標成已送。撈不到就回空陣列，絕不讓它把 webhook 弄壞。"""
+    try:
+        rows = supa.select("job_queue",
+                           f"status=eq.pending&kind=eq.{CC_OUT}"
+                           f"&select=id,payload&order=created_at&limit={limit}")
+    except Exception as e:
+        print(f"[carry err] {e}")
+        return []
+    out = []
+    now = (datetime.utcnow() + timedelta(hours=8)).isoformat(timespec="seconds")
+    for r in rows or []:
+        t = ((r.get("payload") or {}).get("text") or "").strip()
+        if not t:
+            continue
+        out.append(t[:4900])
+        try:
+            supa.update("job_queue", f"id=eq.{r['id']}",
+                        {"status": "done", "finished_at": now,
+                         "result": {"text": "搭 reply 順風車送出"}})
+        except Exception as e:
+            print(f"[carry mark err] {e}")
+    return out
+
+
+def reply_owner(reply_token, text):
+    """回主人。**先把積著送不出去的話夾進來**，再接本來要回的那一句。"""
+    carry = cc_take_pending()
+    if carry:
+        print(f"[carry] 夾帶 {len(carry)} 則先前推不出去的訊息")
+    reply_message(reply_token, carry + [text] if carry else text)
+
+
 SCAN_TOKEN = os.environ.get("SCAN_TOKEN", "")  # 保護 /tasks/scan_alerts
 BASE = os.path.dirname(os.path.abspath(__file__))
 LAST_PUSH_FILE = os.path.join(BASE, "last_stock_push.json")
@@ -761,7 +807,7 @@ def health():
 
 @app.route("/version")
 def version():
-    return "2026-08-26-knowledge-wired", 200
+    return "2026-08-28-reply-carry", 200
 
 @app.route("/portal/push", methods=["POST"])
 def portal_push():
@@ -1033,12 +1079,12 @@ def webhook():
                 if body_text:
                     try:
                         n = cc_put(body_text)
-                        reply_message(reply_token,
-                                      f"📮 收到，已放進星空的信箱（未讀 {n} 封）\n"
-                                      f"他在電腦前的話會馬上看到；沒開機就等下次開工。")
+                        reply_owner(reply_token,
+                                    f"📮 收到，已放進星空的信箱（未讀 {n} 封）\n"
+                                    f"他在電腦前的話會馬上看到；沒開機就等下次開工。")
                     except Exception as e:
                         print(f"[cc_put err] {e}")
-                        reply_message(reply_token, "📮 信箱寫不進去，等等再試一次 😅")
+                        reply_owner(reply_token, "📮 信箱寫不進去，等等再試一次 😅")
                     _write_status("line_bot", "已回覆訊息",
                                   {"messages_today": _bump_messages_today()})
                     continue
@@ -1050,11 +1096,11 @@ def webhook():
                 print(f"[alert err] {e}")
                 alert_reply = None
             if alert_reply is not None:
-                reply_message(reply_token, alert_reply)
+                reply_owner(reply_token, alert_reply)
             else:
                 # AI 走本機大腦佇列（10-40s），不能卡住 webhook（LINE 會逾時重送）。
                 # 先秒回一句「思考中」用 reply，真答案在背景算完用 push 送。
-                reply_message(reply_token, "小星空想一下喔 🌟")
+                reply_owner(reply_token, "小星空想一下喔 🌟")
                 def _bg(uid, msg):
                     try:
                         ans = ask_ai(uid, msg)
