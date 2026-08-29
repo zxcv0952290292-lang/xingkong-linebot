@@ -18,6 +18,7 @@ from datetime import datetime, timedelta
 os.environ.setdefault("TENANT_SCOPE", "1")  # 雲端沒有 .env，租戶隔離開關用環境變數
 import supa  # Supabase 對話記憶（重啟不忘）
 import inbox as m1  # M1 訊息與名單：非主人的訊息走規則自動回（設定在 tenants.config）
+import line_keys  # 一家店的 LINE 鑰匙放哪裡（env 優先，其次雲端加密欄位）
 
 # ─── shared status logger（雲端寫 /tmp，Log 中會列印）───────
 _STATUS_FILE = os.environ.get("STATUS_FILE", "/tmp/status.json")
@@ -807,7 +808,7 @@ def health():
 
 @app.route("/version")
 def version():
-    return "2026-08-28-reply-carry-k2", 200
+    return "2026-08-29-line-keys-db", 200
 
 @app.route("/portal/push", methods=["POST"])
 def portal_push():
@@ -1019,16 +1020,15 @@ def webhook_ferryman():
 
 @app.route("/webhook/t/<tid>", methods=["POST"])
 def webhook_tenant(tid):
-    """一店一條路。開新客戶＝在 Render 加兩個環境變數就好，不用改程式：
-        LINE_SECRET_<租戶大寫>   驗簽（確認訊息真的來自 LINE）
-        LINE_TOKEN_<租戶大寫>    回話（以那家店的身分）
+    """一店一條路。開新客戶＝本機跑一行 `tenant_keys.py --set`，不用進 Render、不用重部署。
+
+    鑰匙從哪裡來由 `line_keys` 那塊決定（env 優先，其次雲端加密欄位）——
+    這裡不該知道它存在哪，換存法不必動這支。
     鑰匙沒設就當這條路不存在（404）——部署了也不會誤接別人的訊息。
     ⚠️ tid 直接進 SQL 查詢，所以只收英數與底線，別的一律擋掉。"""
     if not re.fullmatch(r"[A-Za-z0-9_]{1,32}", tid or ""):
         abort(404)
-    key = tid.upper()
-    secret = os.environ.get(f"LINE_SECRET_{key}", "")
-    token = os.environ.get(f"LINE_TOKEN_{key}", "")
+    secret, token = line_keys.get(tid)
     if not secret or not token:
         abort(404)
     signature = request.headers.get("X-Line-Signature", "")

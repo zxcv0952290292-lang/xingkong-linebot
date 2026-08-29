@@ -7,6 +7,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY line_bot.py .
 COPY supa.py .
+COPY line_keys.py .
 COPY inbox.py .
 COPY knowledge.py .
 COPY stock_names.json .
