@@ -808,7 +808,7 @@ def health():
 
 @app.route("/version")
 def version():
-    return "2026-08-29-line-keys-db", 200
+    return "2026-09-12-supa-log-throttle", 200
 
 @app.route("/portal/push", methods=["POST"])
 def portal_push():
