@@ -16,6 +16,19 @@ from pathlib import Path
 import requests
 
 
+# ── 錯誤日誌節流（2026-09-12）──
+# 斷網 30 分鐘，brain_daemon 每 3 秒輪詢兩張表，brain.log 灌了 14,829 行一模一樣的 Max retries，
+# 而且沒時間戳，事後連「斷線從幾點開始」都算不出來。這裡：同一種錯第 1 次印、之後每 50 次印一次，帶時間。
+_ERR_SEEN: dict = {}
+def _elog(key: str, msg: str) -> None:
+    import datetime as _dt
+    n = _ERR_SEEN.get(key, 0) + 1; _ERR_SEEN[key] = n
+    if n == 1 or n % 50 == 0:
+        print(f"[supa {_dt.datetime.now().strftime('%m-%d %H:%M:%S')}] {msg}" + (f"（同類第 {n} 次）" if n > 1 else ""), flush=True)
+def _eok(key: str) -> None:
+    """成功一次就把計數歸零，下次再壞會重新印第 1 次（＝恢復點也看得到）。"""
+    if _ERR_SEEN.pop(key, None): print(f"[supa {__import__('datetime').datetime.now().strftime('%m-%d %H:%M:%S')}] {key} 恢復", flush=True)
+
 def _load_env():
     url = os.environ.get("SUPABASE_URL")
     key = os.environ.get("SUPABASE_SERVICE_KEY")
@@ -122,11 +135,11 @@ def insert(table: str, rows: list, tenant: str | None = None) -> bool:
             timeout=10,
         )
         if r.status_code >= 300:
-            print(f"[supa] insert {table} 失敗 {r.status_code}: {r.text[:150]}")
+            _elog(f"insert {table}", f"insert {table} 失敗 {r.status_code}: {r.text[:150]}")
             return False
         return True
     except Exception as e:
-        print(f"[supa] insert {table} 例外: {e}")
+        _elog(f"insert {table}", f"insert {table} 例外: {e}")
         return False
 
 
@@ -143,11 +156,11 @@ def upsert(table: str, rows: list, on_conflict: str, tenant: str | None = None) 
             timeout=10,
         )
         if r.status_code >= 300:
-            print(f"[supa] upsert {table} 失敗 {r.status_code}: {r.text[:150]}")
+            _elog(f"upsert {table}", f"upsert {table} 失敗 {r.status_code}: {r.text[:150]}")
             return False
         return True
     except Exception as e:
-        print(f"[supa] upsert {table} 例外: {e}")
+        _elog(f"upsert {table}", f"upsert {table} 例外: {e}")
         return False
 
 
@@ -177,11 +190,37 @@ def update(table: str, query: str, patch: dict, timeout: int = None,
             timeout=timeout,
         )
         if r.status_code >= 300:
-            print(f"[supa] update {table} 失敗 {r.status_code}: {r.text[:150]}")
+            _elog(f"update {table}", f"update {table} 失敗 {r.status_code}: {r.text[:150]}")
             return False
         return True
     except Exception as e:
-        print(f"[supa] update {table} 例外: {e}")
+        _elog(f"update {table}", f"update {table} 例外: {e}")
+        return False
+
+
+def delete(table: str, query: str, tenant: str | None = None) -> bool:
+    """刪掉符合 query 的列。query 例：module_name=eq.job:tcctest
+
+    ⚠️ **一定要帶 query**——PostgREST 沒有條件就是刪整張表。空字串直接拒絕，
+    不要靠呼叫端記得（同 `_filter` 的租戶隔離，安全條件放在共用積木裡才擋得住）。
+    ⚠️ 這支只給「本來就不該存在的列」用（測試殘留、重複列）。
+    真實資料要下架一律改狀態，不要刪（出事才找得回來，同 `_retired/` 的道理）。
+    """
+    if not enabled() or not query.strip():
+        return False
+    query = _filter(table, query, tenant)
+    try:
+        r = requests.delete(
+            f"{URL}/rest/v1/{table}?{query}",
+            headers=_headers("return=minimal"),
+            timeout=20,
+        )
+        if r.status_code >= 300:
+            _elog(f"delete {table}", f"delete {table} 失敗 {r.status_code}: {r.text[:150]}")
+            return False
+        return True
+    except Exception as e:
+        _elog(f"delete {table}", f"delete {table} 例外: {e}")
         return False
 
 
@@ -200,11 +239,11 @@ def select(table: str, query: str = "", tenant: str | None = None) -> list:
             timeout=10,
         )
         if r.status_code >= 300:
-            print(f"[supa] select {table} 失敗 {r.status_code}: {r.text[:150]}")
+            _elog(f"select {table}", f"select {table} 失敗 {r.status_code}: {r.text[:150]}")
             return []
         return r.json()
     except Exception as e:
-        print(f"[supa] select {table} 例外: {e}")
+        _elog(f"select {table}", f"select {table} 例外: {e}")
         return []
 
 
