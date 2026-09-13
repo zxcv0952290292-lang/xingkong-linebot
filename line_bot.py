@@ -685,6 +685,10 @@ def _kline_from_result(result):
 
 
 
+# 2026-09-13：這個 @app.after_request 在 9ccf3c7（08-23 清死依賴）被連帶刪掉，之後 /api/analyze 一直沒有
+# Access-Control-Allow-Origin，ferryman-stock 站上「自選股即時分析」從瀏覽器打過來全被 CORS 擋 → 「分析失敗」。
+# curl／Python 打得通（不受 CORS 約束），所以一直沒被抓到。
+@app.after_request
 def _api_cors(resp):
     if request.path.startswith("/api/"):
         resp.headers["Access-Control-Allow-Origin"] = "*"
@@ -808,7 +812,7 @@ def health():
 
 @app.route("/version")
 def version():
-    return "2026-09-12-supa-log-throttle", 200
+    return "2026-09-13-api-cors-back", 200
 
 @app.route("/portal/push", methods=["POST"])
 def portal_push():
