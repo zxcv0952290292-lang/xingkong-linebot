@@ -1047,7 +1047,44 @@ def webhook_tenant(tid):
                       token=token, tid=tid)
             _write_status("line_bot", f"{tid} 已回覆",
                           {"messages_today": _bump_messages_today()})
+        elif event["type"] == "message" and event["message"]["type"] == "image":
+            # 收據入帳（2026-09-20，「用系統代替文書職缺」第一塊）：老闆或員工把發票／收據拍給店的 OA，
+            # 圖存進 Storage、開一筆待處理，本機 clerk_photo.py 讀圖抽欄位寫回，再用店的 token 回報。
+            # 誰都能拍（店員也要能用），但只有 tenants.config.clerk.enabled 為 true 的店才收。
+            cfg, active = _tenant_cfg(tid)
+            if active and (cfg or {}).get("clerk", {}).get("enabled"):
+                n = clerk_put(tid, event["message"]["id"], event["source"].get("userId", ""), token)
+                reply_message(event["replyToken"],
+                              "📎 收據收到了，正在讀（約 1 分鐘）。讀好會回你：店名／日期／金額／類別。" +
+                              (f"\n今天第 {n} 張。" if n else ""), token=token)
+                _write_status("line_bot", f"{tid} 收據入帳", {"messages_today": _bump_messages_today()})
     return "OK"
+
+
+def clerk_put(tid: str, mid: str, uid: str, token: str) -> int:
+    """把 LINE 圖抓下來放 Storage（bucket clerk，公開讀），開一筆 module_status clerk:<tid>:<mid> pending。
+    回今天這家店第幾張（回覆用）。失敗就丟例外讓上面回錯誤，不要安靜。"""
+    r = requests.get(f"https://api-data.line.me/v2/bot/message/{mid}/content",
+                     headers={"Authorization": f"Bearer {token}"}, timeout=30)
+    r.raise_for_status()
+    url = os.environ.get("SUPABASE_URL", ""); key = os.environ.get("SUPABASE_SERVICE_KEY", "")
+    path = f"{tid}/{mid}.jpg"
+    up = requests.post(f"{url}/storage/v1/object/clerk/{path}",
+                       headers={"apikey": key, "Authorization": f"Bearer {key}",
+                                "Content-Type": r.headers.get("Content-Type", "image/jpeg"), "x-upsert": "true"},
+                       data=r.content, timeout=60)
+    if up.status_code >= 300:
+        raise RuntimeError(f"storage {up.status_code}: {up.text[:120]}")
+    now = (datetime.utcnow() + timedelta(hours=8)).isoformat(timespec="seconds")
+    supa.upsert("module_status", [{"module_name": f"clerk:{tid}:{mid}", "last_run": now, "status": "pending",
+                                   "detail": {"tenant": tid, "uid": uid, "img": f"{url}/storage/v1/object/public/clerk/{path}",
+                                              "pending": True, "at": now}}], "module_name")
+    try:
+        today = now[:10]
+        rows = supa.select("module_status", f"module_name=like.clerk:{tid}:*&last_run=gte.{today}&select=module_name", tenant="*")
+        return len(rows or [])
+    except Exception:
+        return 0
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
@@ -1115,6 +1152,18 @@ def webhook():
                         push_message(uid, "抱歉，我剛剛卡住了，再問我一次好嗎 😅")
                 threading.Thread(target=_bg, args=(user_id, user_message), daemon=True).start()
             _write_status("line_bot", "已回覆訊息", {"messages_today": _bump_messages_today()})
+
+        # 非主人傳圖給小星空：stanley 這個租戶開了收據入帳就收（測試用；正式客戶走 webhook_tenant）
+        elif (event["type"] == "message" and event["message"]["type"] == "image"
+              and event["source"].get("userId") != OWNER_UID
+              and ((_inbox_cfg()[0] or {}).get("clerk", {}).get("enabled"))):
+            try:
+                n = clerk_put("stanley", event["message"]["id"], event["source"].get("userId", ""), FERRYMAN_CHANNEL_TOKEN)
+                reply_message(event["replyToken"], "📎 收據收到了，正在讀（約 1 分鐘）。讀好會回你：店名／日期／金額／類別。" + (f"\n今天第 {n} 張。" if n else ""))
+            except Exception as e:
+                print(f"[clerk_put err] {e}")
+                reply_message(event["replyToken"], "📎 收據收到了，但這張存不進去，等等再傳一次 😅")
+            _write_status("line_bot", "收據入帳", {"messages_today": _bump_messages_today()})
 
         # 主人傳的圖／語音／影片一律進星空信箱。
         # 在這之前這些訊息是**整個被忽略**的（只有 type=="text" 進得來），

@@ -14,6 +14,7 @@ import json
 from pathlib import Path
 
 import requests
+import urllib.parse as _up
 
 
 # ── 錯誤日誌節流（2026-09-12）──
@@ -224,8 +225,56 @@ def delete(table: str, query: str, tenant: str | None = None) -> bool:
         return False
 
 
+def ts(dt) -> str:
+    """把時間轉成**放進網址安全**的字串。所有 `xxx_at=lt.<時間>` 的過濾一律用這支。
+
+    🔴 2026-09-15 抓到的坑：`datetime.isoformat()` 出來是 `2026-09-13T11:29:41+08:00`，
+    直接 f-string 進網址時，`+` 在 query string 裡的意思是**空白**。
+    伺服器收到 `2026-09-13T11:29:41 08:00`，回
+    `400 invalid input syntax for type timestamp with time zone`。
+
+    這件事的代價：`brain_daemon.cleanup_old()` 與 `jobq.cleanup()` 兩支清理
+    **從寫下去的那天起一次都沒刪成功**——因為兩支都是
+    `requests.delete(...)` 之後 `except Exception: pass`，而 400 不是例外，
+    沒有人看回應碼。查到的時候 module_status 裡還躺著 2026-07-14 的工單。
+    「跑完了」不等於「做到了」——同 [[silent-publish-failure]] 那一條。
+    """
+    return _up.quote(dt.isoformat(timespec="seconds") if hasattr(dt, "isoformat") else str(dt),
+                     safe="")
+
+
+def sweep(table: str, query: str, archive: "Path | None" = None, limit: int = 5000) -> int:
+    """清掉符合條件的舊列，**刪之前先在本機留一份**。回傳刪掉幾列（-1＝失敗）。
+
+    為什麼不直接 `delete`：刪掉就真的沒了，而 `_retired/` 的道理是「出事往那裡找」。
+    這支先把要刪的列 select 出來附加進一個 jsonl，再刪。檔案是純附加的，
+    壞了可以自己 insert 回去。
+
+    ⚠️ 跟 `delete()` 一樣，**沒有 query 就拒絕**（沒條件＝刪整張表）。
+    """
+    if not enabled() or not query.strip():
+        return -1
+    rows = select(table, f"{query}&limit={limit}")
+    if not rows:
+        return 0
+    if archive:
+        try:
+            Path(archive).parent.mkdir(parents=True, exist_ok=True)
+            with open(archive, "a", encoding="utf-8") as f:
+                for r in rows:
+                    f.write(json.dumps(r, ensure_ascii=False) + "\n")
+        except Exception as e:
+            _elog(f"sweep {table}", f"sweep {table} 存檔失敗，**不刪**：{e}")
+            return -1          # 留不住備份就不動它
+    return len(rows) if delete(table, query) else -1
+
+
 def select(table: str, query: str = "", tenant: str | None = None) -> list:
-    """查詢，query 為 PostgREST 參數字串（例：user_id=eq.U123&limit=10）。"""
+    """查詢，query 為 PostgREST 參數字串（例：user_id=eq.U123&limit=10）。
+
+    ⚠️ PostgREST 預設**最多回 1000 列**，而且不會告訴你被截斷了。
+    要「全部」的呼叫端自己分頁或帶 `limit=`，不要拿長度當總數。
+    """
     if not enabled():
         return []
     query = _filter(table, query, tenant)
