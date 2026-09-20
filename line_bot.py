@@ -812,7 +812,7 @@ def health():
 
 @app.route("/version")
 def version():
-    return "2026-09-20-clerk-intake", 200
+    return "2026-09-20-clerk-cmds", 200
 
 @app.route("/portal/push", methods=["POST"])
 def portal_push():
@@ -1042,9 +1042,12 @@ def webhook_tenant(tid):
         abort(400)
     for event in json.loads(body).get("events", []):
         if event["type"] == "message" and event["message"]["type"] == "text":
-            m1_handle(event["source"].get("userId", "unknown"),
-                      event["message"]["text"], event["replyToken"],
-                      token=token, tid=tid)
+            _uid = event["source"].get("userId", "unknown"); _txt = event["message"]["text"]
+            _cfg, _active = _tenant_cfg(tid)
+            if _active and (_cfg or {}).get("clerk", {}).get("enabled") and clerk_text(tid, _uid, _txt, event["replyToken"], token):
+                _write_status("line_bot", f"{tid} 文書指令", {"messages_today": _bump_messages_today()})
+                continue
+            m1_handle(_uid, _txt, event["replyToken"], token=token, tid=tid)
             _write_status("line_bot", f"{tid} 已回覆",
                           {"messages_today": _bump_messages_today()})
         elif event["type"] == "message" and event["message"]["type"] == "image":
@@ -1059,6 +1062,91 @@ def webhook_tenant(tid):
                               (f"\n今天第 {n} 張。" if n else ""), token=token)
                 _write_status("line_bot", f"{tid} 收據入帳", {"messages_today": _bump_messages_today()})
     return "OK"
+
+
+# ── 文書職缺替代包：文字指令（2026-09-20）──────────────────────────────────
+# 一個店的 LINE OA 同時是記帳員／報價員／報表員。指令都是白話前綴，老闆不用學：
+#   記 <內容> <金額>          → 一筆支出或收入（金額前面加「收」是收入）
+#   改 金額 1280／改 類別 包材／改 店名 xxx → 改這個人最後一筆
+#   報價 <客戶> <品項>x<數量>x<單價>，…  → 開一張報價單（本機做成 PDF 回連結）
+#   今天／本月                  → 合計與類別分布
+#   刪                          → 刪這個人最後一筆
+# 資料一律在 module_status clerk:<tid>:*，跟收據入帳同一格；網頁台帳讀同一份。
+_CLERK_CATS = ("食材", "包材", "水電瓦斯", "租金", "設備", "交通", "行銷", "人事", "收入", "其他")
+
+def _clerk_rows(tid, since=None, uid=None):
+    q = f"module_name=like.clerk:{tid}:*&select=module_name,last_run,status,detail&order=last_run.desc&limit=400"
+    if since: q += f"&last_run=gte.{since}"
+    rows = supa.select("module_status", q, tenant="*") or []
+    rows = [r for r in rows if not r["module_name"].endswith(":_scan")]
+    if uid: rows = [r for r in rows if (r.get("detail") or {}).get("uid") == uid]
+    return rows
+
+def _clerk_sum(rows):
+    ok = [r["detail"] for r in rows if r.get("status") == "ok" and (r.get("detail") or {}).get("kind", "receipt") in ("receipt", "entry")]
+    spend = sum(int(d.get("total") or 0) for d in ok if d.get("category") != "收入")
+    income = sum(int(d.get("total") or 0) for d in ok if d.get("category") == "收入")
+    cats = {}
+    for d in ok:
+        if d.get("category") == "收入": continue
+        cats[d.get("category") or "其他"] = cats.get(d.get("category") or "其他", 0) + int(d.get("total") or 0)
+    return len(ok), spend, income, cats
+
+def clerk_text(tid, uid, text, reply_token, token):
+    """認得指令就處理並回覆，回 True；不是指令回 False（交給 M1 規則）。"""
+    t = (text or "").strip()
+    now = (datetime.utcnow() + timedelta(hours=8)); ts = now.isoformat(timespec="seconds"); today = ts[:10]
+    def key(prefix): return f"clerk:{tid}:{prefix}{uuid.uuid4().hex[:10]}"
+    def say(msg): reply_message(reply_token, msg, token=token); return True
+    if t in ("今天", "本日", "今日"):
+        n, spend, income, cats = _clerk_sum(_clerk_rows(tid, since=today))
+        body = "\n".join(f"・{k} {v:,}" for k, v in sorted(cats.items(), key=lambda x: -x[1])) or "・（還沒有支出）"
+        return say(f"📊 今天 {n} 筆\n支出 NT$ {spend:,}｜收入 NT$ {income:,}\n{body}")
+    if t in ("本月", "這個月"):
+        n, spend, income, cats = _clerk_sum(_clerk_rows(tid, since=today[:7] + "-01"))
+        body = "\n".join(f"・{k} {v:,}" for k, v in sorted(cats.items(), key=lambda x: -x[1])) or "・（還沒有支出）"
+        return say(f"📊 {today[:7]} 共 {n} 筆\n支出 NT$ {spend:,}｜收入 NT$ {income:,}\n{body}\n\n完整表：https://ferryman-finder.pages.dev/clerk/?t={tid}")
+    m = re.match(r"^記\s*(收)?\s*(.+?)\s*(\d[\d,]*)\s*(元)?$", t)
+    if m:
+        income = bool(m.group(1)); desc = m.group(2).strip(); amt = int(m.group(3).replace(",", ""))
+        cat = "收入" if income else next((c for c in _CLERK_CATS if c in desc), "其他")
+        d = {"tenant": tid, "uid": uid, "kind": "entry", "vendor": desc[:40], "date": today, "total": amt, "category": cat, "pending": False, "at": ts, "items": []}
+        supa.upsert("module_status", [{"module_name": key("e"), "last_run": ts, "status": "ok", "detail": d}], "module_name")
+        return say(f"✅ 記了：{desc}｜NT$ {amt:,}｜{cat}\n有錯回我「改 金額 …」「改 類別 …」；看合計回「今天」或「本月」。")
+    m = re.match(r"^改\s*(金額|類別|店名|日期)\s*(.+)$", t)
+    if m:
+        rows = _clerk_rows(tid, uid=uid)
+        if not rows: return say("你這邊還沒有任何一筆可以改。")
+        r = rows[0]; d = r["detail"]; f, v = m.group(1), m.group(2).strip()
+        if f == "金額":
+            v2 = re.sub(r"[^\d]", "", v)
+            if not v2: return say("金額要是數字，例：改 金額 1280")
+            d["total"] = int(v2)
+        elif f == "類別":
+            if v not in _CLERK_CATS: return say("類別只有：" + "／".join(_CLERK_CATS))
+            d["category"] = v
+        elif f == "店名": d["vendor"] = v[:40]
+        elif f == "日期": d["date"] = v[:10]
+        supa.upsert("module_status", [{"module_name": r["module_name"], "last_run": r["last_run"], "status": "ok", "detail": d}], "module_name")
+        return say(f"✅ 改好了：{d.get('vendor')}｜{d.get('date')}｜NT$ {int(d.get('total') or 0):,}｜{d.get('category')}")
+    if t in ("刪", "刪除", "刪掉"):
+        rows = _clerk_rows(tid, uid=uid)
+        if not rows: return say("沒有可以刪的。")
+        r = rows[0]; supa.delete("module_status", f"module_name=eq.{r['module_name']}", tenant="*")
+        return say(f"🗑 刪了：{(r['detail'] or {}).get('vendor')}｜NT$ {int((r['detail'] or {}).get('total') or 0):,}")
+    m = re.match(r"^報價\s+(\S+)\s+(.+)$", t, re.S)
+    if m:
+        client = m.group(1)[:30]; items = []
+        for part in re.split(r"[，,、\n]+", m.group(2)):
+            im = re.match(r"^\s*(.+?)\s*[xX×＊*]\s*(\d+)\s*[xX×＊*]\s*(\d[\d,]*)\s*$", part)
+            if im: items.append({"name": im.group(1).strip()[:40], "qty": int(im.group(2)), "price": int(im.group(3).replace(",", ""))})
+        if not items: return say("格式：報價 客戶名 品項x數量x單價，品項x數量x單價\n例：報價 王小姐 麵線x50x60，地瓜球x30x50")
+        total = sum(i["qty"] * i["price"] for i in items)
+        d = {"tenant": tid, "uid": uid, "kind": "quote", "client": client, "items": items, "total": total, "date": today, "pending": True, "at": ts}
+        supa.upsert("module_status", [{"module_name": key("q"), "last_run": ts, "status": "pending", "detail": d}], "module_name")
+        lines = "\n".join(f"・{i['name']} ×{i['qty']} @{i['price']:,} ＝ {i['qty']*i['price']:,}" for i in items)
+        return say(f"🧾 報價單建好了：{client}\n{lines}\n合計 NT$ {total:,}\nPDF 約 1 分鐘後傳給你。")
+    return False
 
 
 def clerk_put(tid: str, mid: str, uid: str, token: str) -> int:
@@ -1111,6 +1199,9 @@ def webhook():
             print(f"[用戶訊息]: {user_message}")
             # 非主人 → M1 訊息與名單（規則自動回；小星空只服務主人）
             if user_id != OWNER_UID:
+                if ((_inbox_cfg()[0] or {}).get("clerk", {}).get("enabled")) and clerk_text("stanley", user_id, user_message, reply_token, FERRYMAN_CHANNEL_TOKEN):
+                    _write_status("line_bot", "文書指令", {"messages_today": _bump_messages_today()})
+                    continue
                 m1_handle(user_id, user_message, reply_token)
                 _write_status("line_bot", "已回覆訊息", {"messages_today": _bump_messages_today()})
                 continue
