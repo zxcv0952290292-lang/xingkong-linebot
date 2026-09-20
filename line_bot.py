@@ -812,7 +812,7 @@ def health():
 
 @app.route("/version")
 def version():
-    return "2026-09-20-clerk-cmds", 200
+    return "2026-09-20-clerk-owner", 200
 
 @app.route("/portal/push", methods=["POST"])
 def portal_push():
@@ -1149,6 +1149,19 @@ def clerk_text(tid, uid, text, reply_token, token):
     return False
 
 
+def _owner_clerk_mode() -> bool:
+    """主人打過「收據模式」的 30 分鐘內回 True。讀不到＝False（圖照舊進信箱，不會丟）。"""
+    try:
+        rows = supa.select("module_status", "module_name=eq.clerk:stanley:_ownermode&select=last_run", tenant="*") or []
+        if not rows: return False
+        t = datetime.fromisoformat(rows[0]["last_run"].replace("Z", "+00:00"))
+        now = datetime.utcnow() + timedelta(hours=8)
+        if t.tzinfo is not None: t = t.replace(tzinfo=None) + timedelta(hours=8) if t.utcoffset() == timedelta(0) else t.replace(tzinfo=None)
+        return (now - t).total_seconds() < 1800
+    except Exception as e:
+        print(f"[ownermode err] {e}"); return False
+
+
 def clerk_put(tid: str, mid: str, uid: str, token: str) -> int:
     """把 LINE 圖抓下來放 Storage（bucket clerk，公開讀），開一筆 module_status clerk:<tid>:<mid> pending。
     回今天這家店第幾張（回覆用）。失敗就丟例外讓上面回錯誤，不要安靜。"""
@@ -1205,6 +1218,14 @@ def webhook():
                 m1_handle(user_id, user_message, reply_token)
                 _write_status("line_bot", "已回覆訊息", {"messages_today": _bump_messages_today()})
                 continue
+            if user_message.strip() in ("收據模式", "記帳模式"):
+                _now = (datetime.utcnow() + timedelta(hours=8)).isoformat(timespec="seconds")
+                supa.upsert("module_status", [{"module_name": "clerk:stanley:_ownermode", "last_run": _now, "status": "ok", "detail": {"until_minutes": 30}}], "module_name")
+                reply_message(reply_token, "🧾 收據模式開 30 分鐘：現在傳給我的圖都當發票入帳，不進信箱。打「今天」看合計。")
+                continue
+            if clerk_text("stanley", user_id, user_message, reply_token, FERRYMAN_CHANNEL_TOKEN):
+                _write_status("line_bot", "文書指令", {"messages_today": _bump_messages_today()})
+                continue
             # 「星空 ……」＝要給終端機那邊的 Claude Code，不走 AI、不花額度
             if user_message.startswith(CC_PREFIX):
                 body_text = user_message[len(CC_PREFIX):].strip(" 　:：,，")
@@ -1259,6 +1280,15 @@ def webhook():
         # 主人傳的圖／語音／影片一律進星空信箱。
         # 在這之前這些訊息是**整個被忽略**的（只有 type=="text" 進得來），
         # 所以這裡沒有搶走任何原本的行為。
+        elif (event["type"] == "message" and event["message"]["type"] == "image"
+              and event["source"].get("userId") == OWNER_UID and _owner_clerk_mode()):
+            try:
+                n = clerk_put("stanley", event["message"]["id"], OWNER_UID, FERRYMAN_CHANNEL_TOKEN)
+                reply_message(event["replyToken"], "📎 收據收到了，正在讀（約 1 分鐘）。" + (f"今天第 {n} 張。" if n else ""))
+            except Exception as e:
+                print(f"[clerk_put owner err] {e}")
+                reply_message(event["replyToken"], "📎 這張存不進去，等等再傳 😅")
+            _write_status("line_bot", "收據入帳", {"messages_today": _bump_messages_today()})
         elif (event["type"] == "message"
               and event["message"]["type"] in ("image", "audio", "video", "file")
               and event["source"].get("userId") == OWNER_UID):
