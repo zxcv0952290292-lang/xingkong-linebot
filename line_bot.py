@@ -812,7 +812,7 @@ def health():
 
 @app.route("/version")
 def version():
-    return "2026-09-13-api-cors-back", 200
+    return "2026-09-20-clerk-intake", 200
 
 @app.route("/portal/push", methods=["POST"])
 def portal_push():
