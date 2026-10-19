@@ -146,6 +146,15 @@ def reply_owner(reply_token, text):
     reply_message(reply_token, carry + [text] if carry else text)
 
 
+def reply_owner_quiet(reply_token):
+    """信箱收件不回「📮 收到」（2026-10-11 他：每次傳訊息都跳出多餘的回覆）。
+    答案會由本機那邊推回來，收件確認是多的；只有積著送不出去的話才用這次 reply 夾帶。"""
+    carry = cc_take_pending()
+    if carry:
+        print(f"[carry] 夾帶 {len(carry)} 則先前推不出去的訊息")
+        reply_message(reply_token, carry)
+
+
 SCAN_TOKEN = os.environ.get("SCAN_TOKEN", "")  # 保護 /tasks/scan_alerts
 BASE = os.path.dirname(os.path.abspath(__file__))
 LAST_PUSH_FILE = os.path.join(BASE, "last_stock_push.json")
@@ -812,7 +821,7 @@ def health():
 
 @app.route("/version")
 def version():
-    return "2026-09-20-clerk-owner", 200
+    return "2026-10-19-quiet-inbox-rulecheck", 200
 
 @app.route("/portal/push", methods=["POST"])
 def portal_push():
@@ -1231,10 +1240,8 @@ def webhook():
                 body_text = user_message[len(CC_PREFIX):].strip(" 　:：,，")
                 if body_text:
                     try:
-                        n = cc_put(body_text)
-                        reply_owner(reply_token,
-                                    f"📮 收到，已放進星空的信箱（未讀 {n} 封）\n"
-                                    f"他在電腦前的話會馬上看到；沒開機就等下次開工。")
+                        cc_put(body_text)
+                        reply_owner_quiet(reply_token)
                     except Exception as e:
                         print(f"[cc_put err] {e}")
                         reply_owner(reply_token, "📮 信箱寫不進去，等等再試一次 😅")
@@ -1294,13 +1301,9 @@ def webhook():
               and event["source"].get("userId") == OWNER_UID):
             mtype = event["message"]["type"]
             mid = event["message"]["id"]
-            NAME = {"image": "圖片", "audio": "語音", "video": "影片", "file": "檔案"}
             try:
-                n = cc_put("", media=mtype, message_id=mid)
-                extra = "（會自動轉成文字）" if mtype == "audio" else ""
-                reply_message(event["replyToken"],
-                              f"📮 {NAME[mtype]}收到了{extra}，已放進星空的信箱（未讀 {n} 封）\n"
-                              f"⚠️ LINE 的原檔不會永久保存，他太久沒開機的話附件可能會過期。")
+                cc_put("", media=mtype, message_id=mid)
+                reply_owner_quiet(event["replyToken"])
             except Exception as e:
                 print(f"[cc_put media err] {e}")
                 reply_message(event["replyToken"], "📮 附件收不進信箱，等等再試 😅")

@@ -169,6 +169,11 @@ def _fake_words(text: str) -> list:
     return bad
 
 
+# 規則允許出現的欄位。多一個沒見過的鍵＝十之八九是打錯字，而且不會有任何錯誤訊息。
+KNOWN_RULE_KEYS = {"id", "keywords", "reply", "notify", "set_stage", "add_tags",
+                   "drop", "stage", "note", "_note"}
+
+
 def audit(tid: str | None = None, cfg: "dict | None" = None) -> list:
     """開店關卡：把「這個租戶實際會自動說出口的每一句話」攤開來看。
 
@@ -188,6 +193,11 @@ def audit(tid: str | None = None, cfg: "dict | None" = None) -> list:
             "keywords": list(r.get("keywords") or []),
             "reply": _render(r.get("reply", ""), v),
             "notify": bool(r.get("notify")),
+            # 🔴 2026-10-13：寫錯欄位名會**安靜失效**。我自己踩的——規則寫了
+            #    `needs_human: true`（那是回傳值的欄位名），程式讀的其實是 `notify`，
+            #    結果五條規則看起來有「叫人」，實際上一則都沒進待處理佇列，
+            #    而體檢還回報「問題 0 個」。體檢要擋的就是這種假通過。
+            "unknown": sorted(set(r) - KNOWN_RULE_KEYS),
         })
     seen: dict = {}
     for row in out:
@@ -333,10 +343,16 @@ def main() -> int:
                 print(f"        ⚠️ 觸發字 {w}")
             for w in r.get("fake") or []:
                 print(f"        ⛔ 這句會對客人說出{w}")
+            for k in r.get("unknown") or []:
+                print(f"        ⛔ 看不懂的欄位「{k}」——這條規則的這一格**不會生效**，"
+                      f"而且不會報錯。可用的只有：{'、'.join(sorted(KNOWN_RULE_KEYS))}")
         bad = sum(len(r.get("warn") or []) for r in rows)
         fake = sum(len(r.get("fake") or []) for r in rows)
+        unk = sum(len(r.get("unknown") or []) for r in rows)
         print(f"\n共 {len(rows)} 條，其中 {len(inherited)} 條是行業 preset 繼承來的，"
-              f"觸發字問題 {bad} 個，假字 {fake} 句。")
+              f"觸發字問題 {bad} 個，假字 {fake} 句，看不懂的欄位 {unk} 個。")
+        if unk:
+            print("⛔ 有看不懂的欄位就還不能開通——那格是安靜失效的，改成正確的鍵再跑一次。")
         if fake:
             print("⛔ 有假字就還不能開通——把 vars 換成這家店真的內容再跑一次。")
         if inherited:
