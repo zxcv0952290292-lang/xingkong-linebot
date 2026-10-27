@@ -125,10 +125,38 @@ def _unsure(text: str, hits: list, reply: str) -> str:
     return ""
 
 
+def _live_vars(cfg: dict) -> dict:
+    """回覆用的變數，扣掉「店主改的值已經過期」的那幾個。
+
+    2026-10-27 不眠深夜咖啡：座位狀態是店員在中樞按的（owner_vars.seat），
+    存檔時 portal 一起寫 seat_at。**沒更新的座位狀態比沒有更糟**——
+    店員忘了按，三小時前的「還有位子」會一直講下去，客人白跑一趟。
+    所以 owner_editable 欄位可以設 ttl_min：超過就當沒填（{?seat}…{/seat} 整段消失），
+    沒過期就多給一個 {seat_time}（HH:MM，台北時間）讓回覆講「幾點更新的」。
+    沒設 ttl_min 的欄位（例：早餐店的「今天的狀況」）行為不變。"""
+    v = dict(cfg.get("vars") or {})
+    for f in cfg.get("owner_editable") or []:
+        k, ttl = f.get("key"), f.get("ttl_min")
+        if not k or not ttl:
+            continue
+        try:
+            at = datetime.fromisoformat(str(v.get(f"{k}_at") or "").replace("Z", "+00:00"))
+            if at.tzinfo is None:
+                at = at.replace(tzinfo=TZ)
+            age = (datetime.now(TZ) - at).total_seconds() / 60
+        except ValueError:
+            age = None
+        if age is None or age > ttl or age < -5:
+            v[k] = ""
+        else:
+            v[f"{k}_time"] = at.astimezone(TZ).strftime("%H:%M")
+    return v
+
+
 def classify(text: str, tid: str | None = None, cfg: "dict | None" = None) -> dict:
     """分類＋決定回覆。純函式，不碰資料庫——測試和 --dry 都走這裡。"""
     cfg = _cfg(tid, cfg)
-    v = dict(cfg.get("vars") or {})
+    v = _live_vars(cfg)
     hits = _hits(text, cfg.get("rules") or [])
     if hits:
         hit = hits[0][0]

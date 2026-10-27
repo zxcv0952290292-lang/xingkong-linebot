@@ -821,7 +821,7 @@ def health():
 
 @app.route("/version")
 def version():
-    return "2026-10-19-quiet-inbox-rulecheck", 200
+    return "2026-10-27-seat-ttl", 200
 
 @app.route("/portal/push", methods=["POST"])
 def portal_push():
