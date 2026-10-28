@@ -821,7 +821,18 @@ def health():
 
 @app.route("/version")
 def version():
-    return "2026-10-27-seat-ttl", 200
+    return "2026-10-28-push-token", 200
+
+def _tenant_token(tenant: str) -> str:
+    """租戶 → 他自己的 OA token。跟 webhook 同一個來源（line_keys：env 優先，其次雲端加密欄位）。
+    2026-10-28 不眠：這裡原本只讀 env 的 LINE_TOKEN_<TID>，用 tenant_keys.py 放進雲端的店
+    自動回覆會動、中樞手動回覆卻說「token 未設定」。寧可失敗也不能拿別人的帳號替他發話。"""
+    if tenant == "stanley":
+        return FERRYMAN_CHANNEL_TOKEN
+    if not re.fullmatch(r"[A-Za-z0-9_]{1,32}", tenant or ""):
+        return ""
+    return line_keys.get(tenant)[1]
+
 
 @app.route("/portal/push", methods=["POST"])
 def portal_push():
@@ -843,7 +854,7 @@ def portal_push():
     if not (tenant and uid and text) or len(text) > 1000:
         return jsonify({"error": "缺欄位或太長"}), 400
     # 租戶 → 他自己的 OA token。寧可失敗也不能拿別人的帳號替他發話。
-    tok = FERRYMAN_CHANNEL_TOKEN if tenant == "stanley" else os.environ.get(f"LINE_TOKEN_{tenant.upper()}", "")
+    tok = _tenant_token(tenant)
     if not tok:
         return jsonify({"error": f"租戶 {tenant} 的 LINE token 未設定，回覆要先開通"}), 422
     r = requests.post("https://api.line.me/v2/bot/message/push",
@@ -878,7 +889,7 @@ def portal_richmenu():
         abort(401)
     d = json.loads(body)
     tenant = d.get("tenant", "")
-    tok = FERRYMAN_CHANNEL_TOKEN if tenant == "stanley" else os.environ.get(f"LINE_TOKEN_{tenant.upper()}", "")
+    tok = _tenant_token(tenant)
     if not tok:
         return jsonify({"error": f"租戶 {tenant} 的 LINE token 未設定"}), 422
     H = {"Authorization": f"Bearer {tok}"}
